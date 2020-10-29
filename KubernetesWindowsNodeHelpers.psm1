@@ -1,16 +1,4 @@
-﻿[PSTypeName('KubernetesNodeInstallationConfiguration')]
-[PsCustomObject] $Script:Config
-
-[string] $Script:KubernetesClusterNodeInstallationPath = Join-Path $env:ALLUSERSPROFILE 'Kubernetes'
-[string] $Script:KubernetesClusterNodeConfigurationPath = Join-Path $KubernetesClusterNodeInstallationPath '.kubeclusternodeconfig'
-[string] $Script:KubernetesClusterNodeLogPath = Join-Path $Script:KubernetesClusterNodeInstallationPath 'logs'
-[string] $Script:CniPath = Join-Path $Script:KubernetesClusterNodeInstallationPath 'cni'
-[string] $Script:CniConfigurationPath = Join-Path (Join-Path $Script:CniPath 'config') 'cni.conf'
-[string] $Script:CniNetworkConfigurationPath = Join-Path $Script:KubernetesClusterNodeInstallationPath 'net-conf.json'
-
-$ProgressPreference = 'SilentlyContinue'
-
-function DownloadAndExpandTarGzArchive {
+﻿function DownloadAndExpandTarGzArchive {
     Param (
         [Parameter(Position = 0, Mandatory)]
         [Uri] $Url,
@@ -34,13 +22,13 @@ function DownloadAndExpandZipArchive {
     Param (
         [Parameter(Position = 0, Mandatory)]
         [Uri] $Url,
-        [Praameter(Position = 1)]
+        [Parameter(Position = 1)]
         [string] $DestinationPath = '.'
     )
 
     Process {
         try {
-            $ZipFile = New-TemporaryFile
+            $ZipFile = New-TemporaryFile | Rename-Item -NewName { $_ -replace 'tmp$','zip' } -PassThru
             DownloadFile -Url $Url -Destination $ZipFile -Force
             Expand-Archive $ZipFile.FullName $DestinationPath
             Remove-Item $ZipFile
@@ -54,27 +42,24 @@ function DownloadFile {
     Param (
         [Parameter(Position = 0, Mandatory, ValueFromPipeline)]
         [Uri] $Url,
-        [Parameter(Position = 1, Mandatory)]
+        [Parameter(Position = 1)]
         [string] $Destination,
         [switch] $Force
     )
 
     Process {
-        if (!($Force -and $Force.IsPresent) -and (Test-Path $Destination)) {
+        if (!($Force -and $Force.IsPresent) -and $Destination -and (Test-Path $Destination)) {
             Write-Host "[DownloadFile] File '$Destination' already exists."
             return
         }
 
-        $InsecureProtocols = @([Net.SecurityProtocolType]::SystemDefault, [Net.SecurityProtocolType]::Ssl3)
-        [Net.ServicePointManager]::SecurityProtocol = @(foreach ($protocol in [System.Enum]::GetValues([System.Net.SecurityProtocolType])) {
-            if ($protocol -notin $InsecureProtocols) {
-                $protocol
-            }
-        })
-
         try {
-            Invoke-RestMethod -Method GET -Uri $Url -OutFile $Destination
-            Write-Host "Downloaded [$Url] => [$Destination]"
+            if (!$Destination) {
+                curl.exe -L $Url | ForEach-Object -Begin { $result = New-Object System.Text.StringBuilder } -Process { $result = $result.Append($_) } -End { $result.ToString() }
+            } else {
+                curl.exe -L $Url -o $Destination
+                Write-Host "Downloaded [$Url] => [$Destination]"
+            }
         } catch {
             Write-Error "Failed to download '$Url'"
             throw
@@ -82,7 +67,7 @@ function DownloadFile {
     }
 }
 
-function ValidateKubernetesClusterNodeConfiguration {
+function ValidateKubernetesWindowsNodeConfiguration {
     [CmdletBinding()]
     Param ()
 
@@ -172,22 +157,39 @@ function ValidateKubernetesClusterNodeConfiguration {
                 $Errors += 'Missing ''Cni.Plugin.Version''.'
             }
 
-            $WinVer = "$([Environment]::OSVersion.Version)"
+            $WinVer = Get-WindowsBuildVersion
             if (!$Script:Config.Images) {
                 $Script:Config | Add-Configuration 'Images' ([PSCustomObject]@{
                     NanoServer = "mcr.microsoft.com/windows/nanoserver:$WinVer"
                     ServerCore = "mcr.microsoft.com/windows/servercore:$WinVer"
-                    Pause = [PSCustomObject]@{
-                        BuildImage = $True
-                        Dockerfile = 'https://github.com/microsoft/SDN/raw/master/Kubernetes/windows/Dockerfile'
-                        Image = ''
+                })
+
+                $Script:Config.Images | Add-Configuration 'Infrastructure' $(if ($Script:WinVer -notmatch '^10\.0\.17763') {
+                    [PSCustomObject]@{
+                        Build = $True
+                        FlannelDockerfile = 'https://github.com/kubernetes-sigs/sig-windows-tools/raw/master/kubeadm/flannel/Dockerfile'
+                        KubeProxyDockerfile = 'https://github.com/kubernetes-sigs/sig-windows-tools/raw/master/kubeadm/kube-proxy/Dockerfile'
+                        PauseDockerfile = 'https://github.com/microsoft/SDN/raw/master/Kubernetes/windows/Dockerfile'
+                    }
+                } else {
+                    $InfrastructureImages = [PSCustomObject]@{
+                        Build = $False
+                        Pause = 'mcr.microsoft.com/oss/kubernetes/pause:1.3.0'
                     }
                 })
 
-                Write-Host 'An ''Images'' section cannot be found. Using the following images:'
+                Write-Host 'An ''Images'' section was not found. Using the following images:'
                 Write-Host "    Windows Nano Server: $($Script:Config.Images.NanoServer)"
                 Write-Host "    Windows Server Core: $($Script:Config.Images.ServerCore)"
-                Write-Host "    Pause infrastructure image: Will be built from the dockerfile located at '$($Script:Config.Images.Pause.Dockerfile)'."
+                Write-Host "    Infrastructure images:"
+                if ($Script:WinVer -notmatch '^10\.0\.17763') {
+                    Write-Host "        Custom images must be built because existing images don't support this version of Windows."
+                    Write-Host "        Flannel: $($Script:Config.Images.Infrastructure.FlannelDockerfile)"
+                    Write-Host "        Kube-Proxy: $($Script:Config.Images.Infrastructure.KubeProxyDockerfile)"
+                    Write-Host "        Pause: $($Script:Config.Images.Infrastructure.PauseDockerfile)"
+                } else {
+                    Write-Host "        Pause: $($Script:Config.Images.Infrastructure.Pause)"
+                }
             }
 
             if (!$Script:Config.Images.NanoServer) {
@@ -200,26 +202,34 @@ function ValidateKubernetesClusterNodeConfiguration {
                 Write-Host "'Images.ServerCore' was not specified. Using '$($Script:Config.Images.ServerCore)'."
             }
 
-            if (!$Script:Config.Images.Pause) {
-                $Script:Config.Images | Add-Configuration 'Pause' ([PSCustomObject]@{
-                    Build = $True
-                    Dockerfile = 'https://github.com/microsoft/SDN/raw/master/Kubernetes/windows/Dockerfile'
-                    Image = ''
+            if (!$Script:Config.Images.Infrastructure) {
+                $Script:Config.Images | Add-Configuration 'Infrastructure' $(if ($Script:WinVer -notmatch '^10\.0\.17763') {
+                    [PSCustomObject]@{
+                        Build = $True
+                        FlannelDockerfile = 'https://github.com/kubernetes-sigs/sig-windows-tools/raw/master/kubeadm/flannel/Dockerfile'
+                        KubeProxyDockerfile = 'https://github.com/kubernetes-sigs/sig-windows-tools/raw/master/kubeadm/kube-proxy/Dockerfile'
+                        PauseDockerfile = 'https://github.com/microsoft/SDN/raw/master/Kubernetes/windows/Dockerfile'
+                    }
+                } else {
+                    $InfrastructureImages = [PSCustomObject]@{
+                        Build = $False
+                        Pause = 'mcr.microsoft.com/oss/kubernetes/pause:1.3.0'
+                    }
                 })
-                Write-Host "'Images.Pause' was not specified. An image will be built from the dockerfile located at '$($Script:Config.Images.Pause.Dockerfile)'."
+
+                Write-Host 'An ''Images'' section was not found. Using the following images:'
+                Write-Host "    Windows Nano Server: $($Script:Config.Images.NanoServer)"
+                Write-Host "    Windows Server Core: $($Script:Config.Images.ServerCore)"
+                Write-Host "    Infrastructure images:"
+                if ($Script:WinVer -notmatch '^10\.0\.17763') {
+                    Write-Host "        Custom images must be built because existing images don't support this version of Windows."
+                    Write-Host "        Flannel: $($Script:Config.Images.Infrastructure.FlannelDockerfile)"
+                    Write-Host "        Kube-Proxy: $($Script:Config.Images.Infrastructure.KubeProxyDockerfile)"
+                    Write-Host "        Pause: $($Script:Config.Images.Infrastructure.PauseDockerfile)"
+                } else {
+                    Write-Host "        Pause: $($Script:Config.Images.Infrastructure.Pause)"
+                }
             }
-
-
-            if ($Script:Config.Images.Pause.Build -and !$Script:Config.Images.Pause.DockerFile) {
-                $Script:Config.Images.Pause | Add-Configuration 'Dockerfile' 'https://github.com/microsoft/SDN/raw/master/Kubernetes/windows/Dockerfile'
-                Write-Host "'Images.Pause.Build' was specified but 'Images.Pause.Dockerfile' was not."
-                Write-Host "An image will be built from the dockerfile located at '$($Script:Config.Images.Pause.Dockerfile)'."
-            } elseif (!($Script:Config.Images.Pause.Build -or $Script:Config.Images.Pause.Image)) {
-                $Script:Config.Images.Pause | Add-Configuration 'Image' 'mcr.microsoft.com/oss/kubernetes/pause:1.3.0'
-                Write-Host "'Images.Pause.Build' was not specified or set to 'False', but no 'Images.Pause.Image' was specified."
-                Write-Host "Using '$($Script:Config.Images.Pause.Image)'."
-            }
-
 
             if (!$Script:Config.Kubernetes.Network) {
                 $Script:Config.Kubernetes | Add-Configuration 'Network' ([PSCustomObject]@{
@@ -371,7 +381,8 @@ function Copy-SshKey {
     )
 
     Process {
-        Get-Content $PublicSshKeyPath | ssh "${RemoteUsername}@${RemoteHostname}$(if ($Port) { ":$Port" })" "cat >> .ssh/authorized_keys"
+        $AddAuthorizedKeyCommand = "PUB_KEY=\`"$(Get-Content $PublicSshKeyPath)\`" ; grep -q -F \`"`$PUB_KEY\`" ~/.ssh/authorized_keys 2>/dev/null || echo \`"`$PUB_KEY\`" >> ~/.ssh/authorized_keys"
+        ssh -T "${RemoteUsername}@${RemoteHostname}$(if ($Port) { ":$Port" })" $AddAuthorizedKeyCommand
     }
 }
 
@@ -391,27 +402,34 @@ function Get-CniBinaries {
         [string] $NetworkMode = 'overlay',
         [ValidateSet('flannel','kubenet')]
         [string] $PluginName = 'flannel',
-        [string] $PluginVersion = '0.13.0'
+        [string] $PluginVersion = '0.13.0',
+        [switch] $Force
     )
 
     Process {
         $Script:CniPath = $Path
         $Script:CniConfigurationPath = (Join-Path $Script:CniPath 'config')
 
+        if (($Force -or $Force.IsPrenent) -and (Test-Path $Script:CniPath)) {
+            Remove-Item -Path $Script:CniPath -Recurse -Force
+        }
+
         if (!(Test-Path $Script:CniConfigurationPath)) {
             $null = New-Item -ItemType Directory $Script:CniConfigurationPath
         }
 
-        DownloadAndExpandTarGzArchive -Url "https://github.com/containernetworking/plugins/releases/download/v$Version/cni-plugins-windows-amd64-v$Version.tgz" -DestinationPath $Script:CniPath -ErrorAction Stop
-        Write-Host "Downloaded CNI binaries for the '$NetworkMode' network mode to '$Script:CniPath'."
+        if (!(Test-Path $Script:CniPath)) {
+            DownloadAndExpandTarGzArchive -Url "https://github.com/containernetworking/plugins/releases/download/v$Version/cni-plugins-windows-amd64-v$Version.tgz" -DestinationPath $Script:CniPath -ErrorAction Stop
+            Write-Host "Downloaded CNI binaries for the '$NetworkMode' network mode to '$Script:CniPath'."
 
-        DownloadFile -Url "https://github.com/Microsoft/SDN/raw/master/Kubernetes/flannel/$NetworkMode/cni/config/cni.conf" $Script:CniConfigurationPath  -ErrorAction Stop
-        Write-Host "Downloaded default CNI configuration from GitHub at Microsoft/SDN."
+            DownloadFile -Url "https://github.com/Microsoft/SDN/raw/master/Kubernetes/flannel/$NetworkMode/cni/config/cni.conf" $Script:CniConfigurationPath  -ErrorAction Stop -Force:$Force
+            Write-Host "Downloaded default CNI configuration from GitHub at Microsoft/SDN."
 
-        if ($PluginName -ieq 'flannel') {
-            Get-FlanneldBinaries -Version $PluginVersion
-        } else {
-            throw "The '$PluginName' Container Network Interface (CNI) plugin is not supported yet."
+            if ($PluginName -ieq 'flannel') {
+                Get-FlanneldBinaries -Version $PluginVersion -Force:$Force
+            } else {
+                throw "The '$PluginName' Container Network Interface (CNI) plugin is not supported yet."
+            }
         }
     }
 }
@@ -444,31 +462,85 @@ function Get-FlanneldBinaries {
     Param (
         [Parameter(Position = 0, Mandatory)]
         [string] $Version,
-        [string] $Destination = 'C:\flannel'
+        [string] $Destination = 'C:\flannel',
+        [switch] $Force
     )
 
     Process {
+        if ($Force -and $Force.IsPresent -and (Test_Path $Destination)) {
+            Remove-Item -Path $Destination -Recurse -Force
+        }
+
         if (!(Test-Path $Destination)) {
             $null = New-Item -ItemType Directory $Destination
         }
 
-        DownloadFile -Url "https://github.com/coreos/flannel/releases/download/v$Version/flanneld.exe" -Destination (Join-Path $Destination 'flanneld.exe') -ErrorAction Stop
+        DownloadFile -Url "https://github.com/coreos/flannel/releases/download/v$Version/flanneld.exe" -Destination (Join-Path $Destination 'flanneld.exe') -Force:$Force -ErrorAction Stop
         Write-Host "Finished downloading Flanneld v$Version to '$Destination'"
     }
 }
 
-function Get-HnsHelperScripts {
+function Get-GolangVersionMetadata {
+    [CmdletBinding()]
+    [OutputType('GoLang.VersionMetadata')]
+    Param (
+        [Parameter(ValueFromPipelineByPropertyName)]
+        [ValidatePattern('(?i)\d+\.\d+\.\d+|latest')]
+        [string[]] $Version = 'latest',
+
+        [Parameter(ValueFromPipelineByPropertyName)]
+        [ValidateSet('amd64','arm32v7','arm64v8','i386','ppc64le','s390x','src','windows-amd64')]
+        [string[]] $Architecture = 'windows-amd64'
+    )
+
+    Begin {
+        $GoLangVersionInfo = Invoke-RestMethod -Method GET -Uri 'https://raw.githubusercontent.com/docker-library/golang/master/versions.json' -ErrorAction Stop
+    }
+
+    Process {
+        foreach ($v in $Version) {
+            $GoLangVersionKey = $(
+                if ($v -ne 'latest') {
+                    $MajorMinorVersion = $v -replace '^(\d+\.\d+).*$','$1'
+
+                    $GoLangVersionInfo.PSObject.Properties |
+                        Select-Object -ExpandProperty Name |
+                        Where-Object { $_ -eq $MajorMinorVersion } |
+                        Select-Object -First 1
+                } else {
+                    $GoLangVersionInfo.PSObject.Properties |
+                        Select-Object -Last 1 -ExpandProperty Name
+                }
+            )
+
+            $GoLangVersionMetadata = $GoLangVersionInfo.$GoLangVersionKey
+
+            foreach ($a in $Architecture) {
+                $a = $a.ToLower();
+
+                $GoLangArchVersionInfo = $GoLangVersionMetadata.arches.$a
+                [PSCustomObject]@{
+                    PSTypeName = 'GoLang.VersionMetadata'
+                    Version = $GoLangVersionMetadata.version
+                    Arch = $GoLangArchVersionInfo.arch
+                    Sha256 = $GoLangArchVersionInfo.sha256
+                    Url = $GoLangArchVersionInfo.url
+                }
+            }
+        }
+    }
+}
+
+function Get-HnsScriptModule {
     Param (
         [string] $Path = $Script:KubernetesClusterNodeInstallationPath,
         [switch] $Force
     )
 
     Process {
-        Write-Host "Downloading Windows HNS helper scripts..." -NoNewLine
+        Write-Host "Downloading Windows HNS helper scripts..."
         $Destination = Join-Path $Path 'hns.psm1'
         DownloadFile -Url "https://github.com/Microsoft/SDN/raw/master/Kubernetes/windows/hns.psm1" -Destination $Destination -Force:$Force
-
-        $null = Import-Module $Destination -ErrorAction Stop
     }
 }
 
@@ -521,20 +593,28 @@ function Get-KubernetesBinaries {
         [string] $Path = $Script:KubernetesClusterNodeInstallationPath,
 
         [Parameter(Position = 1)]
-        [string] $Version = '1.19.0'
+        [string] $Version = '1.19.0',
+
+        [switch] $Force
     )
 
     Process {
         try {
-            Write-Host "Downloading Kubernetes v$Version..."
-            DownloadAndExpandTarGzArchive -Url "https://dl.k8s.io/v$Version/kubernetes-node-windows-amd64.tar.gz" -DestinationPath $Path
-            Write-Host "Finished downloading Kubernetes v$Version"
+            if ((Test-Path (Join-Path (Join-Path (Join-Path (Join-Path $Path kubernetes) node) bin) kubectl.exe)) -and $Force -or $Force.IsPresent) {
+                Remove-Item -Path (Join-Path $Path kubernetes) -Recurse -Force
+            }
+
+            if (!(Test-Path (Join-Path $Path kubernetes))) {
+                Write-Host "Downloading Kubernetes v$Version..."
+                DownloadAndExpandTarGzArchive -Url "https://dl.k8s.io/v$Version/kubernetes-node-windows-amd64.tar.gz" -DestinationPath $Path
+                Write-Host "Finished downloading Kubernetes v$Version"
             
-            $KubernetesBinariesPath = Join-Path (Join-Path (Join-Path $Path 'kubernetes') 'node') 'bin'
-            if ($env:PATH -inotmatch [Regex]::Escape($KubernetesBinariesPath)) {
-                $env:PATH = "${env:PATH};$KubernetesBinariesPath"
-                [Environment]::SetEnvironmentVariable("PATH", $env:PATH, [EnvironmentVariableTarget]::Machine)
-                Write-Host "Added Kubernetes executables to the PATH"
+                $KubernetesBinariesPath = Join-Path (Join-Path (Join-Path $Path 'kubernetes') 'node') 'bin'
+                if ($env:PATH -inotmatch [Regex]::Escape($KubernetesBinariesPath)) {
+                    $env:PATH = "${env:PATH};$KubernetesBinariesPath"
+                    [Environment]::SetEnvironmentVariable("PATH", $env:PATH, [EnvironmentVariableTarget]::Machine)
+                    Write-Host "Added Kubernetes executables to the PATH"
+                }
             }
         } catch {
             Write-Host 'Failed to download kuberenetes!'
@@ -567,8 +647,8 @@ function Get-KubernetesClusterConfiguration {
     }
 }
 
-function Get-KubernetesClusterNodeConfiguration {
-    [OutputType('KubernetesClusterNodeConfiguration')]
+function Get-KubernetesWindowsNodeConfiguration {
+    [OutputType('KubernetesWindowsNodeConfiguration')]
     Param(
         [Parameter(Position = 0)]
         [string] $Path = $Script:KubernetesClusterNodeConfigurationPath
@@ -578,8 +658,8 @@ function Get-KubernetesClusterNodeConfiguration {
 
     if (Test-Path $Path) {
         $NodeConfig = Get-Content $Path -Encoding UTF8 -Raw | ConvertFrom-JSON
-        if ('KubernetesClusterNodeConfiguration' -notin $NodeConfig.PSObject.TypeNames) {
-            $null = $NodeConfig.PSObject.TypeNames.Add('KubernetesClusterNodeConfiguration')
+        if ('KubernetesWindowsNodeConfiguration' -notin $NodeConfig.PSObject.TypeNames) {
+            $null = $NodeConfig.PSObject.TypeNames.Add('KubernetesWindowsNodeConfiguration')
         }
     }
 
@@ -666,7 +746,7 @@ function Get-WindowsBuildVersion {
     [OutputType([string])]
     Param()
 
-    ((& cmd /c ver) -replace '.*\[Version (.*)\]','$1').Trim()
+    (& cmd /c ver)[1] -replace '.*\[Version (.*)\]','$1'
 }
 
 function Install-ContainerNetworkInterface {
@@ -674,13 +754,7 @@ function Install-ContainerNetworkInterface {
     Param (
         [string] $InterfaceName = 'Ethernet',
 
-        #[string] $NodeIpAddress = (Get-InterfaceIpAddress),
-
-        #[string] $NodeSubnet = (Get-InterfaceSubnet),
-
-        #[string] $CniConfigurationPath = $Script:CniConfigurationPath,
-
-        [string] $CniNetworkConfigurationPath = $Script:CniNetworkConfigurationPath,
+        [string] $NetworkConfigurationPath = $Script:NetworkConfigurationPath,
 
         [ValidateSet('flannel','kubenet')]
         [string] $CniPluginName = 'flannel',
@@ -695,8 +769,6 @@ function Install-ContainerNetworkInterface {
         [string] $NetworkName = 'vxlan0',
 
         [string] $ClusterCIDR = '10.244.0.0/16',
-
-        #[string] $ServiceCIDR = '10.96.0.0/12',
 
         [string] $KubeConfig = $env:KUBECONFIG
     )
@@ -716,8 +788,7 @@ function Install-ContainerNetworkInterface {
                     # Need to stop the Kubelet service so that we can update the CNI and kubernetes node network configuration
                     Stop-Service Kubelet -WarningAction SilentlyContinue -ErrorAction Stop
 
-                    #Set-CniConfiguration -Path $CniConfigurationPath -NodeIpAddress $NodeIpAddress -NodeSubnet $NodeSubnet -PluginName $CniPluginName -NetworkMode $NetworkMode -NetworkName $NetworkName -ClusterCIDR $ClusterCIDR -ServiceCIDR $ServiceCIDR -ErrorAction Stop
-                    Set-NetConfig -Path $CniNetworkConfigurationPath -NetworkMode $NetworkMode -NetworkName $NetworkName -ClusterCIDR $ClusterCIDR -ErrorAction Stop
+                    Set-NetConfig -Path $NetworkConfigurationPath -NetworkMode $NetworkMode -NetworkName $NetworkName -ClusterCIDR $ClusterCIDR -ErrorAction Stop
                                 
                     New-KubernetesNetwork -InterfaceName $InterfaceName -NetworkMode $NetworkMode -ErrorAction Stop
 
@@ -730,16 +801,7 @@ function Install-ContainerNetworkInterface {
                         }
                     )
 
-                    Install-Flanneld -Path $CniPluginInstallationPath -CniNetworkConfigurationPath $CniNetworkConfigurationPath -Version $CniPluginVersion -InterfaceName (Get-NetAdapter -InterfaceAlias "vEthernet ($InterfaceName)" -ErrorAction SilentlyContinue).InterfaceAlias -KubeConfig $KubeConfig -ErrorAction Stop <#|
-                        Start-Service -ErrorAction Stop
-
-                    <#
-                    WaitForNetwork $NetworkName
-
-                    if (!(Test-NodeRunning)) {
-                        throw "Kubelet is not running and/or failed to bootstrap."
-                    }
-                    #>
+                    Install-Flanneld -Path $CniPluginInstallationPath -NetworkConfigurationPath $NetworkConfigurationPath -Version $CniPluginVersion -InterfaceName (Get-NetAdapter -InterfaceAlias "vEthernet ($InterfaceName)" -ErrorAction SilentlyContinue).InterfaceAlias -KubeConfig $KubeConfig -ErrorAction Stop
 
                     break
                 }
@@ -754,43 +816,11 @@ function Install-ContainerRuntimeInterface {
         [ValidateSet('dockerd','containerd')]
         [string] $Name = 'dockerd',
 
-        [string] $NanoServerImage = 'mcr.microsoft.com/windows/nanoserver:1809',
-
-        [string] $ServerCoreImage = 'mcr.microsoft.com/windows/servercore:1809',
-
-        [Parameter(Mandatory, ParameterSetName = 'PauseImage')]
-        [string] $PauseImage,
-
-        [Parameter(Mandatory, ParameterSetName = 'PauseDockerfile')]
-        [string] $PauseDockerfile,
-
-        [string] $KubeFlannelImage,
-
-        [string] $KubeProxyImage,
-
         [switch] $Force
     )
 
     switch ($Name) {
-        'dockerd' {
-            Install-Dockerd -Force:$Force
-            
-            <#
-            Write-Host "Pulling required docker images. This could take a while..."
-            @(
-                $NanoServerImage
-                $ServerCoreImage
-                $PauseImage
-            ) | Get-DockerImage
-            Write-Host "Docker images pulled."
-
-            
-            if (!$PauseImage) {
-                Write-Host "Building the custom Kubernetes infrastructure container image 'kubeletwin/pause' based on the '$PauseDockerfile' Dockerfile..."
-                New-KubernetesPauseImage $PauseDockerfile
-            }
-            #>
-        }
+        'dockerd' { Install-Dockerd -Force:$Force }
 
         'containerd' {
             throw "The ContainerD CRI is not supported at this time."
@@ -865,13 +895,33 @@ function Install-Dockerd {
     }
 }
 
+function Install-DockerHostNetworkCreator {
+    [CmdletBinding()]
+    [OutputType([System.ServiceProcess.SerivceController])]
+    Param (
+        $Path = $Script:KubernetesClusterNodeInstallationPath
+    )
+
+    Process {
+        Write-Host 'Installing ''Docker host Network Creation Service'' service...'
+
+        $DockerHostNetworkCreationSvc = Get-Service dockerhostnetworkcreator -ErrorAction SilentlyContinue
+        if (!$DockerHostNetworkCreationSvc) {
+            $DockerHostNetworkCreationCommandLine = @(
+                
+            )
+        }
+
+    }
+}
+
 function Install-Flanneld {
     [CmdletBinding()]
     [OutputType([System.ServiceProcess.ServiceController])]
     Param (
         [string] $Path = 'C:\flannel',
 
-        [string] $CniNetworkConfigurationPath = $Script:CniNetworkConfigurationPath,
+        [string] $NetworkConfigurationPath = $Script:NetworkConfigurationPath,
 
         [string] $LogPath = (Join-Path $Script:KubernetesClusterNodeLogPath 'flanneld'),
 
@@ -896,7 +946,7 @@ function Install-Flanneld {
             $FlanneldCommandLine = @(
                 $(Join-Path $Path 'flanneld.exe')
                 "--kubeconfig-file=`"$KubeConfig`""
-                "--net-config-path=`"$CniNetworkConfigurationPath`""
+                "--net-config-path=`"$NetworkConfigurationPath`""
                 "--iface=`"$InterfaceName`""
                 "--ip-masq=1"
                 "--kube-subnet-mgr=1"
@@ -910,89 +960,26 @@ function Install-Flanneld {
     }
 }
 
-function Install-Kubelet_OLD {
-    [CmdletBinding()]
-    Param (
-        [string] $CniPath = $Script:CniPath,
-        [string] $CniConfigurationPath = $Script:CniConfigurationPath,
-
-        [string] $NodeIpAddress = (Get-InterfaceIpAddress),
-
-        [Parameter(Mandatory)]
-        [string] $DnsServiceIpAddress,
-        
-        [string[]] $FeatureGates
-    )
-
-    Process {
-        if (!(Test-Path $Script:KubernetesClusterNodeLogPath)) {
-            $null = New-Item -ItemType Directory -Path $Script:KubernetesClusterNodeLogPath
-        }
-
-        if (!(Get-Service 'kubelet' -ErrorAction SilentlyContinue)) {
-            $KubeletArgs = @(
-                (Get-Command 'kubelet.exe' -ErrorAction Stop).Source
-                '--windows-service'
-                '--v=6'
-                "--log-dir=`"$Script:KubernetesClusterNodeLogPath`""
-                "--cert-dir=`"$env:SYSTEMDRIVE\var\lib\kubelet\pki`""
-                "--cni-bin-dir=`"$CniPath`""
-                "--cni-conf-dir=`"$CniConfigurationPath`""
-                '--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf'
-                "--kubeconfig=$env:KUBECONFIG"
-                "--hostname-override=$($env:COMPUTERNAME.ToLower())"
-                '--pod-infra-container-image=kubeletwin/pause'
-                '--enable-debugging-handlers'
-                '--cgroups-per-qos=false'
-                '--enforce-node-allocatable=""'
-                '--logtostderr=false'
-                '--network-plugin=cni'
-                '--resolv-conf=""'
-                "--cluster-dns=`"$DnsServiceIpAddress`""
-                '--cluster-domain=cluster.local'
-            )
-
-            if ($FeatureGates) {
-                $KubeletArgs += "--feature-gates=$($FeatureGates -join ',')"
-            }
-
-            New-Service -Name 'kubelet' -StartupType Automatic -DependsOn 'docker' `
-                -BinaryPathName "$KubeletArgs"
-
-            if (!(Get-NetFirewallRule -Name KubeletAllow10250 -ErrorAction SilentlyContinue)) {
-                $null = New-NetFirewallRule -Name KubeletAllow10250 -Description "Kubelet Allow 10250" -ACtion Allow -LocalPort 10250 -Protocol TCP -Enabled True -DisplayName "Kubelet Allow 10250 (TCP)" -ErrorAction Stop
-            }
-        }
-    }
-}
-
 function Install-Kubelet {
     [CmdletBinding()]
     Param (
         [string] $CniConfigurationPath = $Script:CniConfigurationPath,
-        [string] $CniNetworkConfigurationPath = $Script:CniNetworkConfigurationPath,
         [string] $CniPath = $Script:CniPath,
         [ValidateSet('flannel','kubenet')]
         [string] $CniPluginName = 'flannel',
-        [string] $CniPluginVersion = '0.13.0',
+
+        [ValidateSet('containerd','dockerd')]
+        [string] $CriName = 'dockerd',
 
         [ValidateSet('overlay','l2bridge')]
         [string] $NetworkMode = 'overlay',
 
         [string] $NetworkName = 'vxlan0',
 
-        [string] $InterfaceName = 'Ethernet',
-
         [string] $NodeIpAddress = (Get-InterfaceIpAddress),
         [string] $NodeSubnet = (Get-InterfaceSubnet),
 
         [string] $KubeConfig = $env:KUBECONFIG,
-
-        [Parameter(Mandatory)]
-        [string] $KubeadmToken,
-
-        [Parameter(Mandatory)]
-        [string] $KubeadmCAHash,
 
         [string] $ClusterCIDR = '10.244.0.0/16',
 
@@ -1020,7 +1007,7 @@ function Install-Kubelet {
                 "--cni-bin-dir=`"$CniPath`""
                 "--cni-conf-dir=`"$CniConfigurationPath`""
                 '--bootstrap-kubeconfig=/etc/kubernetes/bootstrap-kubelet.conf'
-                "--kubeconfig=$env:KUBECONFIG"
+                "--kubeconfig=$KubeConfig"
                 "--hostname-override=$($env:COMPUTERNAME.ToLower())"
                 '--pod-infra-container-image=kubeletwin/pause'
                 '--enable-debugging-handlers'
@@ -1041,42 +1028,10 @@ function Install-Kubelet {
                 -BinaryPathName "$KubeletArgs"
 
             if (!(Get-NetFirewallRule -Name KubeletAllow10250 -ErrorAction SilentlyContinue)) {
-                $null = New-NetFirewallRule -Name KubeletAllow10250 -Description "Kubelet Allow 10250" -ACtion Allow -LocalPort 10250 -Protocol TCP -Enabled True -DisplayName "Kubelet Allow 10250 (TCP)" -ErrorAction Stop
+                $null = New-NetFirewallRule -Name KubeletAllow10250 -Description "Kubelet Allow 10250" -Action Allow -LocalPort 10250 -Protocol TCP -Enabled True -DisplayName "Kubelet Allow 10250 (TCP)" -ErrorAction Stop
             }
 
-            $InstallCNIParams = @{
-                InterfaceName = $(
-                    $NetworkAdatpter = Get-NetAdapter -InterfaceAlias "vEthernet ($InterfaceName)" -ErrorAction SilentlyContinue
-                    if ($NetworkAdapter) {
-                        $NetworkAdapter.InterfaceAlias
-                    } else {
-                        $InterfaceName
-                    }
-                )
-                CniNetworkConfigurationPath = $CniNetworkConfigurationPath
-                CniPluginName = $CniPluginName
-                CniPluginVersion = $CniPluginVersion
-                NetworkMode = $NetworkMode
-                NetworkName = $NetworkName
-                ClusterCIDR = $ClusterCIDR
-                KubeConfig = $KubeConfig
-            }
-            Install-ContainerNetworkInterface -ErrorAction Stop @InstallCNIParams
-            Write-Host "Finished installing the Container Network Interface (CNI)."
-
-            & cmd /c kubeadm join "$(Get-ApiServerEndpoint)" --token $KubeadmToken --discovery-token-ca-cert-hash "$KubeadmCAHash" '2>&1'
-            if (!$?) {
-                Write-Error "Error joining cluster!"
-                return
-            }
-
-            Start-Service FlannelD
-
-            WaitForNetwork $NetworkName
-
-            if (!(Test-NodeRunning)) {
-                throw "Kubelet is not running and/or failed to bootstrap."
-            }
+            Get-Service -Name 'Kubelet'
         }
     }
 }
@@ -1120,7 +1075,7 @@ function Install-KubeProxy {
                     kubeconfig = $KubeConfig
                 }
                 winkernel = @{
-                    enableDsr = $FeatureGates -match 'WinDSR=true'
+                    enableDsr = 'WinDSR=true' -iin $FeatureGates
                     networkName = $NetworkName
                 }
             }
@@ -1140,7 +1095,7 @@ function Install-KubeProxy {
                 '--windows-service'
             )
 
-            if ($FeatureGates -match 'WinDSR=true') {
+            if ('WinDSR=true' -iin $FeatureGates) {
                 $KubeProxyArgs += '--enable-dsr=true'
             }
 
@@ -1163,8 +1118,9 @@ function Install-KubeProxy {
     }
 }
 
+# TODO: Add parameters for the working directory...maybe other stuff...this cmdlet has A LOT of assumptions baked into it.....
 function Join-KubernetesCluster {
-    $Script:Config = Get-KubernetesClusterNodeConfiguration
+    $Script:Config = Get-KubernetesWindowsNodeConfiguration
 
     $null = Import-Module "$Script:KubernetesClusterNodeInstallationPath\hns.psm1" -WarningAction 'SilentlyContinue'
 
@@ -1184,27 +1140,16 @@ function Join-KubernetesCluster {
         [Environment]::SetEnvironmentVariable('KUBE_NETWORK', $env:KUBE_NETWORK, [EnvironmentVariableTarget]::Machine)
     }
 
-    <#$InstallKubeletParams = @{
-        CniPath = $Script:CniPath
-        CniConfigurationPath = $Script:CniConfigurationPath
-        DnsServiceIpAddress = $Script:Config.Kubernetes.Network.DnsServiceIpAddress
-        NodeIpAddress = $Script:Config.Node.IpAddress
-        FeatureGates = $Script:Config.Kubernetes.Kubelet.FeatureGates
-    }#>
     $InstallKubeletParams = @{
         CniPath = $Script:CniPath
         CniConfigurationPath = $Script:CniConfigurationPath
-        CniNetworkConfigurationPath = $Script:CniNetworkConfigurationPath
         CniPluginName = $Script:Config.Cni.Plugin.Name
-        CniPluginVersion = $Script:Config.Cni.Plugin.Version
-        InterfaceName = $Script:Config.Node.InterfaceName
+        CriName = $Script:Config.Cri.Name
         NetworkMode = $Script:Config.Cni.NetworkMode
         NetworkName = $Script:Config.Cni.NetworkName
         NodeIpAddress = $Script:Config.Node.IPAddress
         NodeSubnet = $Script:Config.Node.Subnet
         KubeConfig = $env:KUBECONFIG
-        KubeadmToken = $Script:Config.Kubernetes.ControlPlane.JoinToken
-        KubeadmCAHash = $Script:Config.Kubernetes.ControlPlane.CAHash
         ClusterCIDR = $Script:Config.Kubernetes.Network.ClusterCIDR
         ServiceCIDR = $Script:Config.Kubernetes.Network.ServiceCIDR
         DnsServiceIpAddress = $Script:Config.Kubernetes.Network.DnsServiceIpAddress
@@ -1213,7 +1158,6 @@ function Join-KubernetesCluster {
     Install-Kubelet -ErrorAction Stop @InstallKubeletParams
     Write-Host "Installed Kubelet as a Windows Service"
     
-    <#
     $InstallCNIParams = @{
         InterfaceName = $(
             $NetworkAdatpter = Get-NetAdapter -InterfaceAlias "vEthernet ($($Script:Config.Node.InterfaceName))" -ErrorAction SilentlyContinue
@@ -1223,23 +1167,18 @@ function Join-KubernetesCluster {
                 $Script:Config.Node.InterfaceName
             }
         )
-        #NodeIPAddress = $Script:Config.Node.IPAddress
-        #NodeSubnet = $Script:Config.Node.Subnet
-        #CniConfigurationPath = $Script:CniConfigurationPath
-        CniNetworkConfigurationPath = $Script:CniNetworkConfigurationPath
+        NetworkConfigurationPath = $Script:NetworkConfigurationPath
         CniPluginName = $Script:Config.Cni.Plugin.Name
         CniPluginVersion = $Script:Config.Cni.Plugin.Version
         NetworkMode = $Script:Config.Cni.NetworkMode
         NetworkName = $Script:Config.Cni.NetworkName
         ClusterCIDR = $Script:Config.Kubernetes.Network.ClusterCIDR
-        #ServiceCIDR = $Script:Config.Kubernetes.Network.ServiceCIDR
         KubeConfig = $env:KUBECONFIG
     }
     Install-ContainerNetworkInterface -ErrorAction Stop @InstallCNIParams
     Write-Host "Finished installing the Container Network Interface (CNI)."
 
-    <#
-    & cmd /c kubeadm join "$(Get-ApiServerEndpoint)" --token $Script:Config.Kubernetes.ControlPlane.JoinToken --discovery-token-ca-cert-hash "$($Script:Config.Kubernetes.ControlPlane.CAHash)" '2>&1'
+    kubeadm.exe join "$(Get-ApiServerEndpoint)" --token $Script:Config.Kubernetes.ControlPlane.JoinToken --discovery-token-ca-cert-hash "$($Script:Config.Kubernetes.ControlPlane.CAHash)"
     if (!$?) {
         Write-Error "Error joining cluster!"
         return
@@ -1250,7 +1189,6 @@ function Join-KubernetesCluster {
     if (!(Test-NodeRunning)) {
         throw "Kubelet is not running and/or failed to bootstrap."
     }
-    #>
     
     $KubeProxyInstallParams = @{
         NetworkName = $Script:Config.Cni.NetworkName
@@ -1266,6 +1204,224 @@ function Join-KubernetesCluster {
     kubectl.exe get nodes
 
     Write-Host "Node $($env:COMPUTERNAME) successfully joined the cluster."
+}
+
+function New-GoLangContainerImage {
+    [CmdletBinding()]
+    Param (
+        [PSTypeName('GoLang.VersionMetadata')]
+        [PSCustomObject] $GoLangVersionMetadata = (Get-GoLangVersionMetadata),
+        [switch] $Force
+    )
+
+    Process {
+        if ($Force -and $Force.IsPresent) {
+            # Remove the old image so it gets rebuilt
+            $null = docker image rm -f $(docker images golang -q | Select-Object -First 1) -ErrorAction Ignore
+        }
+
+        if (!(docker images golang -q)) {
+            $Version = $GoLangVersionMetadata.Version
+
+            $Tags = @(
+                "$Version-windowsservercore-$Script:WinVer"
+                "$Version-windowsservercore"
+                "$Version"
+            ) | ForEach-Object { "golang:$_" }
+
+            $LatestGfwReleasePage = DownloadFile -Url 'https://github.com/git-for-windows/git/releases/latest'
+            $result = $LatestGfwReleasePage -match '<td>MinGit-(?<Version>\d+\.\d+\.\d+)-64-bit\.zip</td>\s*<td>(?<Hash>.*?)</td>'
+            if (!$result) {
+                Write-Error "Unable to find the latest Git for Windows MinGit release version number or it's SHA-256 authenticity hash in order to build a custom GoLang Docker container image which is required for building OS-specific Kuberenetes infrastructure docker container images."
+                return
+            }
+
+            $LatestMinGitGfwReleaseVersion = $Matches.Version
+            $LatestMinGitGfwReleaseHash = $Matches.Hash
+        
+            $GoLangDockerfileTemplate = Invoke-RestMethod -Method GET -Uri 'https://raw.githubusercontent.com/docker-library/golang/master/Dockerfile-windows-servercore.template' -ErrorAction Stop
+            $GoLangDockerfileTemplate `
+                -replace '\{\{\s*env\.WindowsVariant\s*\}\}:\{\{\s*env\.WindowsRelease\s*\}\}', "servercore:$Script:WinVer" `
+                -replace 'SHELL \[.*?\]', 'SHELL ["powershell", "-NoLogo", "-NonInteractive", "-Command", "$ErrorActionPreference = ''Stop''; $ProgressPreference = ''SilentlyContinue'';"]' `
+                -replace 'ENV GIT_VERSION\s+', "ARG GIT_VERSION=" `
+                -replace 'ENV GIT_DOWNLOAD_SHA256\s+', "ARG GIT_DOWNLOAD_SHA256=" `
+                -replace 'ENV GOLANG_VERSION\s+(\{\{\s*\.version\s*\}\})', @'
+ARG GOLANG_VERSION="$1"
+ARG GOLANG_DOWNLOAD_URL
+ARG GOLANG_DOWNLOAD_SHA256
+'@ `
+                -replace '''\{\{\s*\.arches\["windows-amd64"\]\.url\s*\}\}''', '$env:GOLANG_DOWNLOAD_URL' `
+                -replace '''\{\{\s*\.arches\["windows-amd64"\]\.sha256\s*\}\}''', '$env:GOLANG_DOWNLOAD_SHA256' |
+                Set-Content golang.dockerfile -ErrorAction Stop
+
+            docker build --build-arg GIT_VERSION=$LatestMinGitGfwReleaseVersion --build-arg GIT_DOWNLOAD_SHA256=$LatestMinGitGfwReleaseHash --build-arg GOLANG_VERSION=$Version --build-arg GOLANG_DOWNLOAD_URL=$($GoLangVersionMetadata.Url) --build-arg GOLANG_DOWNLOAD_SHA256=$($GoLangVersionMetadata.Sha256) -t $Tags[0] -t $Tags[1] -t $Tags[2] -f golang.dockerfile .
+            if (!(docker images golang -q)) {
+                Write-Error "Failed to build Golang docker container image."
+            }
+        } else {
+            Write-Host "Using the existing Docker image for Go: 'golang:$Version-windowsservercore-$Script:WinVer'."
+        }
+    }
+}
+
+function New-KubernetesFlannelContainerImage {
+    [CmdletBinding()]
+    Param (
+        [string] $GoLangDockerImageTag = "$((Get-GoLangVersionMetadata).Version)-windowsservercore-$Script:WinVer",
+        [string] $FlannelDockerfile = 'https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/flannel/Dockerfile',
+        [string] $FlannelVersion = '0.13.0',
+        [string] $CniVersion = '0.8.7',
+        [switch] $Force
+    )
+
+    Process {
+        $Tags = @(
+            "$FlannelVersion-windowsservercore-$Script:WinVer"
+            "$FlannelVersion-windowsservercore"
+            $FlannelVersion
+        ) | ForEach-Object { "kubeletwin/flannel:$_" }
+
+        if ($Force -and $Force.IsPresent) {
+            # Remove the old images
+            $null = docker images $Tags[0] -q | ForEach-Object { docker images rm $_ -f }
+        }
+
+        if (!(docker images $Tags[0] -q)) {
+            $WorkingDir = Join-Path $PWD flannel
+
+            if (!(Test-Path $WorkingDir)) {
+                $null = New-Item -ItemType Directory -Path $WorkingDir
+            }
+
+            $OriginalLocation = Get-Location
+            try {
+                Set-Location $WorkingDir
+
+                Get-HnsScriptModule -Path $PWD
+                Invoke-RestMethod -Method GET -Uri ($FlannelDockerfile -replace 'Dockerfile$','setup.go') -OutFile setup.go
+
+                # Get the latest version number/tag of yq from GitHub:
+                $YqLatestReleaseMetadata = Invoke-RestMethod -Method GET -Uri 'https://api.github.com/repos/mikefarah/yq/releases/latest' -ErrorAction Stop
+                $LatestYqVersion = $YqLatestReleaseMetadata.'tag_name'
+
+                # Get the latest version number/tag of wins from GitHum:
+                $WinsLatestReleaseMetadata = Invoke-RestMethod -Method GET -Uri 'https://api.github.com/repos/rancher/wins/releases/latest' -ErrorAction Stop
+                $LatestWinsVersion = $WinsLatestReleaseMetadata.'tag_name'
+
+                # Getting the dockerfile separately because we need to modify it...see below.
+                $FlannelDockerfileContent = Invoke-RestMethod -Method GET -Uri $FlannelDockerfile
+
+                # Update the dockerfile so we can dynamically specify the version of flannel to use
+                $FlannelDockerfileContent = $FlannelDockerfileContent `
+                    -replace 'ARG cniVersion\r?\n', @'
+ARG flannelVersion=0.13.0
+ARG cniVersion="0.8.5"
+ARG winsVersion="v0.0.4"
+ARG yqVersion="2.4.1"
+ENV FLANNEL_DOWNLOAD_URL https://github.com/coreos/flannel/releases/download/v${flannelVersion}/flanneld.exe
+
+'@ `
+                    -replace '(pushd C:\\k\\flannel; \\)\r?\n\s*curl\.exe.*?/flanneld\.exe', @'
+$1
+  Write-Host ('Downloading Flannel v{0} from {1}...' -f $env:flannelVersion, $env:FLANNEL_DOWNLOAD_URL); \
+  curl.exe -LO ${env:FLANNEL_DOWNLOAD_URL}
+'@ `
+                    -replace '(pushd c:\\cni; \\)', @'
+$1
+  Write-Host ('Downloading CNI plugins release v{0}...' -f $env:cniVersion); \
+'@ `
+                    -replace '(mkdir C:\\utils; \\)', @'
+$1
+  Write-Host ('Downloading rancher wins {0}...' -f $env:winsVersion); \
+'@ `
+                    -replace 'wins/releases/download/v0\.0\.4/wins', 'wins/releases/download/${env:winsVersion}/wins' `
+                    -replace '(curl.exe -Lo C:\\utils.*/yq_windows_amd64\.exe;\s+\\)', @'
+Write-Host ('Downloading yq v{0}...' -f $env:yqVersion); \
+  $1
+'@ `
+                    -replace 'yq/releases/download/2\.4\.1/yq_windows_amd64','yq/releases/download/${env:yqVersion}/yq_windows_amd64' |
+                    Set-Content Dockerfile -ErrorAction Stop
+
+                Write-Host @"
+About to execute:
+
+docker build --build-arg servercoreTag=$Script:WinVer --build-arg cniVersion=$CniVersion --build-arg golangTag=$GoLangDockerImageTag --build-arg flannelVersion=$FlannelVersion --build-arg yqVersion=$LatestYqVersion --build-arg winsVersion=$LatestWinsVersion -t kubeletwin/flannel:${FlannelVersion}-windowsservercore-$Script:WinVer -t kubeletwin/flannel:$FlannelVersion -t kubeletwin/flannel:latest .
+
+"@
+
+                docker build --build-arg servercoreTag=$Script:WinVer --build-arg cniVersion=$CniVersion --build-arg golangTag=$GoLangDockerImageTag --build-arg flannelVersion=$FlannelVersion --build-arg yqVersion=$LatestYqVersion --build-arg winsVersion=$LatestWinsVersion -t $Tags[0] -t $Tags[1] -t $Tags[2] .
+                if (!(docker images 'kubeletwin/flannel' -q)) {
+                    Write-Error "Failed to build Kubernetes Windows Flannel v$FlannelVersion docker container networking image."
+                }
+            } finally {
+                Set-Location $OriginalLocation
+            }
+        }
+    }
+}
+
+function New-KubernetesKubeProxyContainerImage {
+    [CmdletBinding()]
+    Param (
+        [string] $KubeProxyDockerfile = 'https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kube-proxy/Dockerfile',
+        [string] $KubernetesVersion = '1.19.3',
+        [switch] $Force
+    )
+
+    Process {
+        $Tags = @(
+            "${KubernetesVersion}-windowsservercore-$Script:WinVer"
+            "${KubernetesVersion}-windowsservercore"
+            $KubernetesVersion
+        ) | ForEach-Object { "kubeletwin/kube-proxy:$_" }
+
+        if ($Force -and $Force.IsPresent) {
+            # Remove the old images
+            $null = docker images $Tags[0] -q | ForEach-Object { docker images rm $_ -f } -ErrorAction SilentlyContinue
+        }
+
+        if (!(docker images $Tags[0] -q)) {
+            # Get the latest version number/tag of yq from GitHub:
+            $YqLatestReleaseMetadata = Invoke-RestMethod -Method GET -Uri 'https://api.github.com/repos/mikefarah/yq/releases/latest' -ErrorAction Stop
+            $LatestYqVersion = $YqLatestReleaseMetadata.'tag_name'
+
+            # Get the latest version number/tag of wins from GitHum:
+            $WinsLatestReleaseMetadata = Invoke-RestMethod -Method GET -Uri 'https://api.github.com/repos/rancher/wins/releases/latest' -ErrorAction Stop
+            $LatestWinsVersion = $WinsLatestReleaseMetadata.'tag_name'
+
+            # Getting the dockerfile separately because we need to modify it...see below.
+            $KubeProxyDockerfileContent = Invoke-RestMethod -Method GET -Uri $KubeProxyDockerfile
+
+            # Update the dockerfile so we can dynamically specify the version of flannel to use
+            $KubeProxyDockerfileContent `
+                -replace '(ARG k8sVersion)\r?\n', @'
+$1
+ARG winsVersion="v0.0.4"
+ARG yqVersion="2.4.1"
+
+'@ `
+                -replace '(pushd C:\\k\\kube-proxy; \\)', @'
+$1
+  Write-Host ('Downloading Kube-Proxy {0}...' -f $env:k8sVersion); \
+'@ `
+                -replace '(mkdir C:\\utils; \\)', @'
+$1
+  Write-Host ('Downloading rancher wins {0}...' -f $env:winsVersion); \
+'@ `
+                -replace 'wins/releases/download/v0\.0\.4/wins', 'wins/releases/download/${env:winsVersion}/wins' `
+                -replace '(curl.exe -sLo C:\\utils.*/yq_windows_amd64\.exe;\s+\\)', @'
+Write-Host ('Downloading yq v{0}...' -f $env:yqVersion); \
+  $1
+'@ `
+                -replace 'yq/releases/download/2\.4\.1/yq_windows_amd64','yq/releases/download/${env:yqVersion}/yq_windows_amd64' |
+                Set-Content Dockerfile -ErrorAction Stop
+
+            docker build --build-arg k8sVersion=v$KubernetesVersion --build-arg servercoreTag=$Script:WinVer --build-arg winsVersion=$LatestWinsVersion --build-arg yqVersion=$LatestYqVersion -t $Tags[0] -t $Tags[1] -t $Tags[2] .
+            if (!(docker images 'kubeletwin/kube-proxy' -q)) {
+                Write-Error "Failed to build Kubernetes Windows kube-proxy docker container imaage."
+            }
+        }
+    }
 }
 
 function New-KubernetesNetwork {
@@ -1292,60 +1448,30 @@ function New-KubernetesNetwork {
     }
 }
 
-function New-KubernetesNodeInstallationResumptionScheduledTask {
-    $MyArgs = $MyInvocation.Line -replace $MyInvocation.InvocationName
-    $MyCommand = $MyInvocation.MyCommand.Name
-    $MyModule = $MyInvocation.MyCommand.ModuleName
-
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass { Import-Module '$MyModule'; $MyCommand $MyArgs }" -WorkingDirectory $pwd
-    Write-Output "Created scheduled task action to resume kubernetes node installation after reboot."
-
-    try {
-        $trigger = New-ScheduledTaskTrigger -AtLogOn
-        Write-Output "Cretaed a scheduled task trigger to execute the task action at the next logon."
-
-        $null = Register-ScheduledTask -TaskName "KubernetesNodeBootstrap" -Action $action -Trigger $trigger -RunLevel Highest
-        Write-Host "Registered the scheduled task."
-    } catch {
-        throw
-    }
-}
-
-function New-KubernetesFlannelImage {
-    Param (
-        [string] $Dockerfile,
-        [string] $CniVersion = '0.8.7',
-        [string] $FlannelVersion = '0.13.0',
-        [switch] $Force
-    )
-
-    $Tags = @(
-        ("${FlannelVersion}-windowsservercore:$(Get-WindowsBuildVersion)" -replace '\s+')
-        $FlannelVersion
-        'latest'
-    ) | ForEach-Object { "sigwindowstools/flannel:$_" }
-
-    if (!(docker images $Tags[0] -q) -or ($Force -and $Force.IsPresent)) {
-        # Remove the old images, if present so we don't keep around unnecssary images
-        $Tags | ForEach-Object { docker images rm $_ -f } -ErrorAction SilentlyContinue
-
-
-    }
-}
-
 function New-KubernetesPauseContainerImage {
     Param (
         [string] $Dockerfile,
         [switch] $Force
     )
 
-    if (!(docker images 'kubeletwin/pause' -q) -or ($Force -and $Force.IsPresent)) {
-        docker build -t 'kubeletwin/pause' "$Dockerfile"
+    Process {
+
+        if ($Force -and $Force.IsPresent) {
+            # Remove the old image
+            $null = docker images 'kubeletwin/pause' -q | ForEach-Object { docker images rm $_ -f } -ErrorAction Stop
+        }
+
+        if (!(docker images 'kubeletwin/pause' -q)) {
+            docker build -t 'kubeletwin/pause' "$Dockerfile"
+            if (!(docker images 'kubeletwin/pause' -q)) {
+                Write-Error "Failed to build Kubernetes Windows infrastructure 'pause' docker container image."
+            }
+        }
     }
 }
 
-function New-KubernetesClusterNodeConfiguration {
-    [OutputType('KubernetesNodeInstallationConfiguration')]
+function New-KubernetesWindowsNodeConfiguration {
+    [OutputType('KubernetesWindowsNodeConfiguration')]
     Param (
         [validateSet('flannel','kubenet')]
         [string] $CniPluginName = 'flannel',
@@ -1395,8 +1521,6 @@ function New-KubernetesClusterNodeConfiguration {
         [string] $ServerCoreImage
     )
 
-    $WinVer = Get-WindowsBuildVersion
-
     if (!$NanoServerImage) {
         $NanoServerImage = "mcr.microsoft.com/windows/nanoserver:$WinVer" -replace '\s+'
     }
@@ -1405,38 +1529,28 @@ function New-KubernetesClusterNodeConfiguration {
         $ServerCoreImage = "mcr.microsoft.com/windows/servercore:$WinVer" -replace '\s+'
     }
 
-    # If you're using a version of Windows Server 2019 that is not LTSC2019 (or 1809), then the
-    # standard kube-flannel and kube-proxy images will not run on your OS version. Alse need to build
-    # a custom kubernetes infrastructure image (Pause image) in this case.
+    # If you're using a version of Windows Server 2019 that is not LTSC2019 (or 1809), 1903, or 1909,
+    # then the standard kube-flannel and kube-proxy images will not run on your OS version. Alse need
+    # to build a custom kubernetes infrastructure image (Pause image) in this case.
     #
     # Otherwise, we can use the standard images.
-    if ($WinVer -notmatch '^10\.0\.17763') {
-        if (!$PauseImage) {
-            $Pause = [PSCustomObject]@{
-                Build = $True
-                Dockerfile = 'https://github.com/microsoft/SDN/raw/master/Kubernetes/windows/Dockerfile'
-                Image = ''
-            }
-        } else {
-            $Pause = [PSCustomObject]@{
-                Build = $False
-                Dockerfile = ''
-                Image = $PauseImage
-            }
-        }
-
-        $KubeletImages = [PSCustomObject]@{
+    #
+    if ($Script:WinVer -notmatch '^10\.0\.17763') {
+        $InfrastructureImages = [PSCustomObject]@{
             Build = $True
             FlannelDockerfile = 'https://github.com/kubernetes-sigs/sig-windows-tools/raw/master/kubeadm/flannel/Dockerfile'
             KubeProxyDockerfile = 'https://github.com/kubernetes-sigs/sig-windows-tools/raw/master/kubeadm/kube-proxy/Dockerfile'
+            PauseDockerfile = 'https://github.com/microsoft/SDN/raw/master/Kubernetes/windows/Dockerfile'
         }
     } else {
-        $Pause = [PSCustomObject]@{ Build = $False; Image = "mcr.microsoft.com/oss/kubernetes/pause:1.3.0" }
-        $KubehletImages = [PSCustomObject]@{ Build = $False }
+        $InfrastructureImages = [PSCustomObject]@{
+            Build = $False
+            Pause = 'mcr.microsoft.com/oss/kubernetes/pause:1.3.0'
+        }
     }
 
     $Script:Config = [PSCustomObject]@{
-        PSTypeName = 'KubernetesClusterNodeConfiguration'
+        PSTypeName = 'KubernetesWindowsNodeConfiguration'
         Cri = [PSCustomObject]@{
             Name = $Cri
         }
@@ -1447,13 +1561,15 @@ function New-KubernetesClusterNodeConfiguration {
             Plugin = [PSCustomObject]@{
                 Name = $CniPluginName          # e.g. flannel, kubenet
                 Version = $CniPluginVersion.ToLower().TrimStart('v')
+                WindowsNodeConfigurationUrl = $(if ($CniPluginName -ieq 'flannel') {
+                    "https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/flannel/flannel-$(if ($NetworkMode -ieq 'overlay') { 'overlay' } else { 'host-gw' }).yml"
+                })
             }
         }
         Images = [PSCustomObject] @{
             NanoServer = $NanoServerImage
             ServerCore = $ServerCoreImage
-            Pause = $Pause
-            KubeletImages = $KubletImages
+            Infrastructure = $InfrastructureImages
         }
         Kubernetes = [PSCustomObject]@{
             Version = $KubernetesVersion.ToLower().TrimStart('v')
@@ -1468,6 +1584,7 @@ function New-KubernetesClusterNodeConfiguration {
             }
             KubeProxy = [PSCustomObject]@{
                 FeatureGates = [string[]]@($KubeProxyGates)
+                WindowsNodeConfigurationUrl = 'https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/kube-proxy/kube-proxy.yml'
             }
             Network = [PSCustomObject]@{
                 ClusterCIDR = $KubeClusterCIDR
@@ -1509,6 +1626,7 @@ function New-ServiceEx {
         $Service = New-Service -Name $Name -BinaryPathName $WrappedServiceExe -DependsOn $DependsOn -DisplayName $Name -StartupType Automatic -Description "$Name Kubernetes Service"
 
         Write-Host @"
+
 ++++++++++++++++++++++++++++++++
 Successfully created the service
 ++++++++++++++++++++++++++++++++
@@ -1518,6 +1636,7 @@ Environment : [$($EnvironmentVariable | ConvertTo-JSON)]
 Log File    : [$LogFilePath]
 Deponds On  : [$($DependsOn -join ', ')]
 +++++++++++++++++++++++++++++++++
+
 "@
 
         $Service
@@ -1626,13 +1745,15 @@ public class ${Name}ScmService : ServiceBase {
             startInfo.RedirectStandardError = true;
             startInfo.FileName = "$ServiceExe";
             startInfo.Arguments = "$ServiceArgs";
-            $($EnvironmentVariable.Keys |
-                ForEach-Object -Begin { $envSrc = '' } -Process {
-                    $envSrc += @"
+            $(if ($EnvironmentVariable) {
+                $EnvironmentVariable.Keys |
+                    ForEach-Object -Begin { $envSrc = '' } -Process {
+                        $envSrc += @"
             startInfo.EnvironmentVariables["$_"] = "$($EnvironmentVariable[$_])";
 "@
-                } -End {
-                    $envSrc
+                    } -End {
+                        $envSrc
+                    }
                 }
             )
 
@@ -1738,289 +1859,605 @@ function New-SshKey {
     }
 }
 
-
-
-<# Additional steps:
-
-1. Build custom GoLang docker build image for your version of Windows Server so that we can create custom kube-flannel and kube-proxy images later
-    a. Download the dockerfile: https://raw.githubusercontent.com/docker-library/golang/master/Dockerfile-windows-servercore.template => C:\golang\Dockerfile
-    b. Get the current windows version:
-           PS C:\> $WinVer = ((&cmd /c ver) -replace '.*\[Version (.*)\]','$1').Trim()
-    c. Update the docker file as follows and build the Golang image:
-           PS C:\> (Get-Content Dockerfile -Raw) `
-                       -replace 'windows/\{\{ env\.WindowsVariant \}\}:\{\{ env\.WindowsRelease \}\}', "windows/serveccore:$WinVer" `
-                       -replace 'ENV GIT_VERSION 2.23.0', 'ENV GIT_VERSION 2.29.0' `
-                       -replace 'ENV GIT_DOWNLOAD_SHA256 .*$', 'ENV GIT_DOWNLOAD_SHA256 b10bc7aa7222f3537071604bc7f9394e72f78a21c3c2bae24490270ba5259863' `
-                       -replace 'ENV GOLANG_VERSION \{\{ .version \}\}', 'ENV GOLANG_VERSION 1.15' `
-                       -replace '\{\{ .arches\["windows-amd64"\].url \}\}', 'https://storage.googleapis.com/golang/go1.15.3.windows-amd64.zip' `
-                       -replace '\{\{ .arches\["windows-amd64"\].sha256 \}\}', '1d579d0e980763f60bf43afb7c3783caf63433a485731ef4d2e262878d634b3f' | Set-Content Dockerfile
-           PS C:\> docker build -t golang:windowsservercore-$WinVer .
-
-2. Build custom flannel docker image for Windows Server based on current version of node host OS:
-    a. Download dockerfile for kube-flannel: https://github.com/kubernetes-sigs/sig-windows-tools/raw/master/kubeadm/flannel/Dockerfile
-           PS C:\> curl -L https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/flannel/Dockerfile -o kube-flannel.docker
-    b. Build and tag the image:
-           PS C:\> docker build --build-arg serverCoreTag=$WinVer --build-arg cniVersion=0.8.7 --build-arg golangTag=windowsservercore-$WinVer -t kubeletwin/flannel:$CniPluginVersion-windowsservercore-$WinVer -t kubeletwin/flannel:$CniPluginVersion -t kubeletwin/flannel:latest -f kube-flannel.docker .
-
-3. Download the flannel-overlay.yml k8s network configuration file and transfer to master node and apply to the cluster:
-    PS C:\> curl -LO https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/flannel/flannel-overlay.yml
-    PS C:\> (Get-Content flannel-overlay.yml -Raw) -replace 'sigwindowstools/flannel:\d+\.\d+\.\d+$', "kubeletwin/flannel:$CniPluginVersion-windowsservercore-$WinVer"
-    PS C:\> scp -o StrictHostKeyChecking=no flannel-overlay.yml "${MasterUsername}@$($MasterAddress -replace ':6443'):~/flannel-overlay.yml"
-    PS C:\> ssh $MasterUsername:$($MasterAddress -replace ':6443') "kubectl apply -f flannel-overlay.yml"
-
-4. Build custom kube-proxy docker image  for Windows Server based on current version of node host OS:
-    a. Download dockerfile for kube-proxy:
-           PS C:\> curl -L https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/kube-proxy/Dockerfile -o kube-proxy.docker
-    b. Build and tag the image:
-           PS C:\> docker build --build-arg k8sVersion="v1.19.3" --build-arg servercoreTag="$WinVer" -t kubeletwin/kube-proxy:$KubernetesVersion-windowsservercore-$WinVer -t kubeletwin/kube-proxy:$kubernetesVersion -t kubeletwin/kube-proxy:latest -f kube-proxy.docker .
-
-3. Download the kube-proxy.yml k8s proxy configuration file and transfer to master node and apply to the cluster:
-    PS C:\> curl -LO https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/kube-proxy/kube-proxy.yml
-    PS C:\> (Get-Content kube-proxy.yml -Raw) -replace 'sigwindowstools/kube-proxy:VERSION$', "kubeletwin/kube-proxy:$KubernetesVersion-windowsservercore-$WinVer"
-    PS C:\> scp -o StrictHostKeyChecking=no kube-proxy.yml "${MasterUsername}@$($MasterAddress -replace ':6443'):~/kube-proxy.yml"
-    PS C:\> ssh $MasterUsername:$($MasterAddress -replace ':6443') "kubectl apply -f kube-proxy.yml"
-
-#>
-
 function New-WindowsKubernetesClusterNode {
     [CmdletBinding()]
     Param (
-        [string] $ConfigurationFile,
+        [string] $ConfigurationFile = $Script:KubernetesClusterNodeConfigurationPath,
+        [string] $WorkspacePath = 'c:\k',
         [switch] $Force
     )
 
     Set-ExecutionPolicy -ExecutionPolicy Unrestricted -Force
 
-    $RequiresRestart = $False
+    $Script:Cwd = Get-Location
 
-    if ($ConfigurationFile -and (Test-Path $ConfigurationFile)) {
-        $Script:Config = Get-Content $ConfigurationFile -Encoding UTF8 -Raw -ErrorAction Stop | ConvertFrom-JSON -ErrorAction Stop
-        ValidateKubernetesClusterNodeConfiguration -ErrorAction Stop
-        if (!Set-KubernetesClusterNodeConfiguration $Script:Config -Force:$Force) {
-            while (!$resp -or $resp -ieq 'Y') {
-                $resp = Read-Host "Do you want to read the existing configuration file? [Y/n] (Default 'Y') "
-                $Script:Config = Get-KubernetesClusterNodeConfiguration
-                ValidateKubernetesClusterNodeConfiguration -ErrorAction Stop
-            }
-        }
-    } elseif (!$Script:Config) {
-        $Script:Config = Get-KubernetesClusterNodeConfiguration
-        ValidateKubernetesClusterNodeConfiguration -ErrorAction Stop
-    } else {
-        $Script:Config | Set-KubernetesClusterNodeConfiguration -Force:$Force
-    }
-    
-    if (!$Script:Config) {
-        Write-Error "Unable to find existing kubernetes node configuration information at '$Script:KubernetesClusterNodeInstallationPath\.kubeclusterconfig'. Please supply a Kuberentes Cluster node configuration file."
-    }
-     
-    Write-KubernetesClusterNodeConfiguration $Script:Config
-
-    if (Get-NetFirewallProfile -Name 'Domain','Private','Public' | ForEach-Object -Begin { $Enabled = $False } -Process { $Enabled = $Enabled -or $_.Enabled } -End { $Enabled }) {
-        if (!($Force -and $Force.IsPresent)) {
-            Write-Host "One or more of the Domain, Private, or Public firewall profiles are enabled."
-            Write-Host "It is recommended to disable these firewall profiles."
-            $resp = Read-HostEx -Prompt "Disable the Domain, Private, and Public firewall profiles? [Y/n] (Default 'Y') " -ExpectedValue 'Y','n'
-        }
-
-        if (($Force -and $Force.IsPresent) -or !$resp -or $resp -ieq 'y') {
-            Set-NetFirewallProfile -Name 'Domain','Private','Public' -Enabled False
-            Write-Host "Disabled the Domain, Private and Public firewall profiles on this machine."
-        }
+    if (!(Test-Path $WorkspacePath)) {
+        $null = New-Item -ItemType Directory -Path $WorkspacePath
     }
 
-    $RequiresRestart = Uninstall-WindowsDefenderFeature -Force:$Force
-    $RequiresRestart = $RequireRestart -or (Install-ContainersFeature -Force:$Force)
-    if ($RequiresRestart) {
-        if (!($Force -and $Force.IsPresent)) {
-            Write-Host "In order to continue configuring Kubernetes, the server must be restarted."
-            $resp = Read-HostEx "Reboot the server now? [Y/n] (Default 'Y') " -ExpectedValue 'Y','n'
-            if (!$resp -or $resp -ieq 'y') {
-                try {
-                    New-KubernetesNodeInstallationResumptionScheduledTask
+    try {
+        Set-Location -Path $WorkspacePath
 
-                    if ($Force -and $Force.IsPresent) {
-                        Restart-Computer -Force:$Force
-                        return
-                    }
-                } catch {
-                    Write-Error "An error occurred while scheduling the kubernetes node installation to resume at next logon."
+        $RequiresRestart = $False
+
+        ######################################################################################################################
+        #
+        # Read Kubernetes cluster node configuration metadata
+        #
+        ######################################################################################################################
+        if ($ConfigurationFile -and (Test-Path $ConfigurationFile)) {
+            $Script:Config = Get-KubernetesWindowsNodeConfiguration -Path $ConfigurationFile -ErrorAction Stop
+            ValidateKubernetesWindowsNodeConfiguration -ErrorAction Stop
+            if (!(Set-KubernetesWindowsNodeConfiguration $Script:KubernetesClusterNodeConfigurationPath -Force:$Force)) {
+                $resp = Read-HostEx "Do you want to read the existing configuration file? [Y/n] (Default 'Y') " -ExpectedValue 'Y','n'
+                if (!$resp -or $resp -ieq 'y') {
+                    $Script:Config = Get-KubernetesWindowsNodeConfiguration
+                    ValidateKubernetesWindowsNodeConfiguration -ErrorAction Stop
                 }
             }
         }
-
-        $MyModule = $MyInvocation.MyCommand.ModuleName
-        $MyCommand = $MyInvocation.MyCommand.Name
-        $MyArgs = $MyInvocation.Line -replace $MyInvocation.InvocationName
-        Write-Host "The server must be restarted in order to continue configuring it as a kubernetes node."
-        Write-Host "Once the server has restarted, log in and run the following commands:"
-        Write-Host
-        Write-Host "    Import-Module $MyModule"
-        Write-Host "    $MyCommand $MyArgs"
-        Write-Host
-
-        return
-    }
-
-    DownloadFile -Url "https://github.com/microsoft/SDN/raw/master/Kubernetes/windows/hns.psm1" -Destination "$Script:KubernetesClusterNodeInstallationPath\hns.psm1"
-    $null = Import-Module "$Script:KubernetesClusterNodeInstallationPath\hns.psm1" -WarningAction 'SilentlyContinue'
-
-    if (!(Test-Path (Join-Path (Join-Path $env:USERPROFILE '.ssh') 'id_rsa.pub'))) {
-        if (!($Force -and $Force.IsPresent)) {
-            $resp = Read-HostEx "Do you wish to generate a SSH Key and add it to the Linux control-plane node? [Y/n] (Default 'Y') "
-            if (!$resp -or $resp -ieq 'y') {
-                New-SshKey
-
-                Write-Host "When prompted, please enter your SSH passphrase in order to copy your public SSH key to the Linux control-plane."
-                Copy-SshKey -
-            }   
-        } else {
-            Write-Host "Generating SSH key ..."
-            New-SshKey -PassPhrase ''
-            cmd /c "ssh-keyscan.exe $($Script:Config.Kubernetes.ControlPlane.MasterAddress) 2>NUL" | Out-File -Encoding Utf8 (Join-Path (Join-Path $env:USERPORFILE '.ssh') 'known_hosts')
+        
+        if (!$Script:Config) {
+            $Script:Config = Get-KubernetesWindowsNodeConfiguration
+            ValidateKubernetesWindowsNodeConfiguration -ErrorAction Stop
         }
-    } else {
-        Write-Host "If you haven't already copied your public SSH key to the Linux control-plane, please do so before joining this server to the Kubernetes cluster."
-        Write-Host "Execute the following commands on the Linux control-plane node '$($Config.Kubernetes.ControlPlane.MasterAddress)' to add this Windows"
-        Write-Host "node's public key to the authorized keys file:"
-        Write-Host
-        Write-Host "    echo $(Get-Content (Join-Path (Join-Path $env:USERPROFILE .ssh) id_rsa.pub) -Raw) >> ~/.ssh/authorized_keys"
-        Write-Host
-        Write-Host "Alternatively, execute the following command from another PowerShell shell on this machine:"
-        Write-Host
-        Write-Host "    Copy-SshKey -RemoteUsername $($Script:Config.Kubernetes.ControlPlane.MasterUsername) -RemoteHostname $($Script:Config.Kubernetes.ControlPlane.MasterAddress)"
-        Write-Host
-    }
+    
+        if (!$Script:Config) {
+            Write-Error "Unable to find existing kubernetes node configuration information at '$Script:KubernetesClusterNodeInstallationPath\.kubeclusterconfig'. Please supply a Kuberentes Cluster node configuration file."
+        }
+     
+        Write-KubernetesWindowsNodeConfiguration $Script:Config
 
-    # Building some of the images below, if required, will require the Windows Server images.
-    # So these images must be pulled first...
-    Write-Host "Pulling required docker images. This could take a while..."
-    @(
-        $NanoServerImage
-        $ServerCoreImage
-        $PauseImage
-    ) | Get-DockerImage
-    Write-Host "Docker images pulled."
+        ######################################################################################################################
+        #
+        # Configure Firewall
+        #
+        ######################################################################################################################
+        if (Get-NetFirewallProfile -Name 'Domain','Private','Public' | ForEach-Object -Begin { $Enabled = $False } -Process { $Enabled = $Enabled -or $_.Enabled } -End { $Enabled }) {
+            if (!($Force -and $Force.IsPresent)) {
+                Write-Host "One or more of the Domain, Private, or Public firewall profiles are enabled."
+                Write-Host "It is recommended to disable these firewall profiles."
+                $resp = Read-HostEx -Prompt "Disable the Domain, Private, and Public firewall profiles? [Y/n] (Default 'Y') " -ExpectedValue 'Y','n'
+            }
 
-    # !!!!! BUILD ANY REQUIRED DOCKER IMAGES HERE !!!!!
-    if ($Script:Config.Images.Pause.Build -and $Script:Config.Images.Pause.Build.IsPresent) {
-        Write-Host "Building the custom Kubernetes infrastructure container image 'kubeletwin/pause' based on the '$PauseDockerfile' Dockerfile..."
-        New-KubernetesPauseContainerImage $PauseDockerfile
-    }
+            if (($Force -and $Force.IsPresent) -or !$resp -or $resp -ieq 'y') {
+                Set-NetFirewallProfile -Name 'Domain','Private','Public' -Enabled False
+                Write-Host "Disabled the Domain, Private and Public firewall profiles on this machine."
+            }
+        }
 
-    if ($Script:Config.Images.KubeletImages.Build -and $Script:Config.Images.KubeletImages.Build.IsPresent) {
-        $WinVer = Get-WindowsBuildVersion
+        ######################################################################################################################
+        #
+        # Uninstall Windows Defender
+        #
+        ######################################################################################################################
+        $RequiresRestart = Uninstall-WindowsDefenderFeature -Force:$Force
 
-        # Build GoLang image
-        # 0. Get latest Git-For-Windows release information: MinGit 64-bit ZIP file download link and SHA-256 hash
-        $LatestGfwReleasePage = Invoke-RestMethod -Method GET -Uri 'https://github.com/git-for-windows/git/release/latest'
-        $result = $LatestGfwReleasePage -match '<td>MinGit-(?<Version>\d+\.\d+\.\d+)-64-bit\.zip</td>\s+<td>(?<Hash>.*)</td>'
-        if (!$result) {
-            Write-Error "Unable to find a link to download the latest Git for Windows MinGit release and/or it's SHA-256 authenticity hash in order to build a custom GoLang Docker container image which is required for building OS-specific Kuberenetes infrastructure docker container images."
+        ######################################################################################################################
+        #
+        # Install Containers feature
+        #
+        ######################################################################################################################
+        $RequiresRestart = $RequireRestart -or (Install-ContainersFeature -Force:$Force)
+
+        ######################################################################################################################
+        #
+        # Remove existing SSH Capabilities; download newer SSH components and configure Ssh-Agent to start automatically and start SSH-Agent
+        #
+        ######################################################################################################################
+
+        # The SSH-Agent that ships with Windows only supports sending RSA SHA-1 signatures. OpenSSH considers SHA-1 to be too
+        # weak (given it only costs $50K to collide SHA-1 hashes). So newer versions of SSH reject these hashes. Which all but
+        # makes the version of ssh-agent that ships with Windows useless when interacting with Linux servers. This has been
+        # "fixed" for 18-months, but not yet released. Since we can't wait, let's just use the version the PowerShell team
+        # maintains (which eventually ends up in Windows anyway).
+        $OpenSshCapability = Get-WindowsCapability -Online | Where-Object { $_.Name -match 'OpenSSH' -and $_.State -eq 'Installed' }
+        if ($OpenSshCapability) {
+            $CapabilityRemovalResults = Remove-WindowsCapability -Name $OpenSshCapability.Name -Online:$($OpenSshCapability.Online)
+
+            # Record whether or not the server requires a restart due to removing the OpenSSH capability.
+            $RequiresRestart = $RequiresRestart -or $CapabilityRemovalResults.RestartNeeded
+        }
+
+        # Remove any existing mention of SSH in the PATH environment variable.
+        if ($env:PATH -imatch [Regex]::Escape((Join-Path (Join-Path $env:SystemRoot System32) OpenSSH))) {
+            $env:PATH = $env:PATH -replace [Regex]::Escape((Join-Path (Join-Path $env:SystemRoot System32) OpenSSH))
+            [Environment]::SetEnvironmentVariable('PATH',$env:PATH,[EnvironmentVariableTarget]::Machine)
+        }
+
+        # Download and install the latest available version of OpenSSH as maintained by the PowerShell team.
+        $LatestSSHReleaseMetadata = Invoke-RestMethod -Method GET -Uri 'https://api.github.com/repos/powershell/win32-openssh/releases/latest' |
+            Where-Object { $_.prerelease -eq $False } |
+            Select-Object -First 1
+        $LatestSSHReleaseVersion = $LatestSSHReleaseMetadata.name -replace '^v(\d+\.\d+)\.\d+\.\d+(p\d+).*$','$1$2'
+
+        Write-Host "Checking to see if SSH v$LatestSSHReleaseVersion is installed..."
+
+        try {
+            where.exe ssh.exe *>$null
+            $SshIsInstalled = $?
+            if ($SshIsInstalled) {
+                Start-Process ssh "-V" -NoNewWindow -RedirectStandardError ssh.version -Wait
+            }
+
+            if (!$SshIsInstalled -or (Get-Content ssh.version) -notmatch $LatestSSHReleaseVersion) {
+                $SshUrl = $LatestSSHReleaseMetadata.assets |
+                    Where-Object { $_.name -ieq 'OpenSSH-Win64.zip' } |
+                    Select-Object -ExpandProperty 'browser_download_url'
+                Write-Host "Downloading SSH from '$SshUrl'..."
+                DownloadAndExpandZipArchive -Url $SshUrl
+
+                Move-Item -Path .\OpenSSH-Win64 -Destination C:\OpenSSH -Force
+                $SshAgentPath = Join-Path (Join-Path C: OpenSSH) ssh-agent.exe
+                $SshdPath = Join-Path (Join-Path C: OpenSSH) sshd.exe
+                    
+                # The below is from install-sshd.ps1 which is now in C:\OpenSSH. We don't need SSHD running,
+                # we only want to replace ssh and ssh-agent (mainly ssh-agent). However, if SSHD is installed,
+                # then replace it, too.
+                $etwmanifest = 'C:\OpenSSH\openssh-events.man'
+                $Sshd = Get-Service sshd -ErrorAction SilentlyContinue
+                if ($Sshd)
+                {
+                    $sshd | Stop-Service
+                    sc.exe delete sshd 1>$null
+                }
+
+                if (Get-Service ssh-agent -ErrorAction SilentlyContinue) {
+                    Stop-Service ssh-agent
+                    sc.exe delete ssh-agent 1>$null
+                }
+
+                # Unregister ETW provider
+                wevtutil um `"$etwmanifest`"
+
+                [xml]$xml = Get-Content $etwmanifest
+                $xml.instrumentationManifest.instrumentation.events.provider.resourceFileName = 'C:\OpenSSH\ssh-agent.exe'
+                $xml.instrumentationManifest.instrumentation.events.provider.messageFileName = 'C:\OpenSSH\ssh-agent.exe'
+
+                $streamWriter = $null
+                $xmlWriter = $null
+                try {
+                    $streamWriter = new-object System.IO.StreamWriter($etwmanifest)
+                    $xmlWriter = [System.Xml.XmlWriter]::Create($streamWriter)    
+                    $xml.Save($xmlWriter)
+                }
+                finally {
+                    if($streamWriter) {
+                        $streamWriter.Close()
+                    }
+                }
+
+                #register etw provider
+                wevtutil im `"$etwmanifest`"
+
+                $sshAgentDesc = 'Agent to hold private keys used for public key authentication.'
+                $null = New-Service -Name ssh-agent -DisplayName 'OpenSSH Authentication Agent' -Description $sshAgentDesc -BinaryPathName `"$sshagentpath`" -StartupType Automatic
+                sc.exe sdset ssh-agent "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RP;;;AU)"
+                sc.exe privs ssh-agent SeImpersonatePrivilege
+
+                if ($Sshd) {
+                    $sshdDesc = 'SSH protocol based service to provide secure encrypted communications between two untrusted hosts over an insecure network.'
+                    $null = New-Service -Name sshd -DisplayName "OpenSSH SSH Server" -BinaryPathName `"$sshdpath`" -Description $sshdDesc -StartupType Manual
+                    sc.exe privs sshd SeAssignPrimaryTokenPrivilege/SeTcbPrivilege/SeBackupPrivilege/SeRestorePrivilege/SeImpersonatePrivilege
+                }
+
+                # !!! END install-sshd.ps1
+
+                # Add C:\OpenSSH to the front of the PATH, so that this version is picked up over the one installed with Windows.
+                if ($env:PATH -inotmatch 'C:\\OpenSSH') {
+                    $env:PATH = "C:\OpenSSH;$env:PATH"
+                    [Environment]::SetEnvironmentVariable('PATH', $env:PATH, [EnvironmentVariableTarget]::Machine)
+                }
+            }
+        } finally {
+            Remove-Item ssh.version -ErrorAction SilentlyContinue
+            Remove-Item -Recurse OpenSSH-Win64 -ErrorACtion SilentlyContinue
+        }
+
+        $SshAgent = Get-Service ssh-agent -ErrorAction SilentlyContinue
+        if ($SshAgent) {
+            $SshAgent | Set-Service -StartupType Automatic -PassThru | Start-Service
+        }
+
+
+        ######################################################################################################################
+        #
+        # If needed, register a resumption scheduled task and reboot the server.
+        #
+        ######################################################################################################################
+        if ($RequiresRestart) {
+            if (!($Force -and $Force.IsPresent)) {
+                Write-Host "In order to continue configuring Kubernetes, the server must be restarted."
+                $resp = Read-HostEx "Reboot the server now? [Y/n] (Default 'Y') " -ExpectedValue 'Y','n'
+                if (!$resp -or $resp -ieq 'y') {
+                    try {
+                        Register-KubernetesNodeInstallationResumptionScheduledTask
+
+                        if ($Force -and $Force.IsPresent) {
+                            Restart-Computer -Force:$Force
+                            return
+                        }
+                    } catch {
+                        Write-Error "An error occurred while scheduling the kubernetes node installation to resume at next logon."
+                    }
+                }
+            }
+
+            $MyModule = $MyInvocation.MyCommand.ModuleName
+            $MyCommand = $MyInvocation.MyCommand.Name
+            $MyArgs = $MyInvocation.Line -replace $MyInvocation.InvocationName
+            Write-Host "The server must be restarted in order to continue configuring it as a kubernetes node."
+            Write-Host "Once the server has restarted, log in and run the following commands:"
+            Write-Host
+            Write-Host "    Import-Module $MyModule"
+            Write-Host "    $MyCommand $MyArgs"
+            Write-Host
+
             return
         }
 
-        $LatestMinGitGfwReleaseVersion = $Matches.Version
-        $LatestMinGitGfwReleaseHash = $Matches.Hash
-        
-        # 1. Get the GoLang docker file to be used to build a custom GoLang build docker container image
-        $GoLangVersionInfo = Invoke-RestMethod -Method GET -Uri 'https://raw.githubusercontent.com/docker-library/golang/master/versions.json'
-        $GoLangLatestVersion = $GoLangVersionInfo.PSObject.Properties | Select-Object -Last 1 -ExpandProperty Name
-        $GoLangDockerfileTemplate = Invoke-RestMethod -Method GET -Uri 'https://raw.githubusercontent.com/docker-library/golang/master/Dockerfile-windows-servercore.template'
-        $GoLangDockerfileTemplate `
-            -replace '\{\{\s+env\.WindowsVariant\s+\}\}:\{\{\s+env\.WindowsRelease\s+\}\}', "windows/servercore:$WinVer" `
-            -replace 'ENV GIT_VERSION 2.23.0', "ENV GIT_VERSION $LatestMinGitGfwReleaseVersion" `
-            -replace 'ENV GIT_DOWNLOAD_SHA256\s+.*$', "ENV GIT_DOWNLOAD_SHA256 $LatestMinGitGfwReleaseHash" `
-            -replace '\{\{\s+\.arches\["windows-amd64"\]\.url\s+\}\}', "$($GoLangVersionInfo."$GoLangLatestVersion".arches.url)" `
-            -replace '\{\{\s+\.arches\["windows-amd64"\]\.sha256\s+\}\}', "$($GoLangVersionInfo."$GoLangLatestVersion".arches.sha256)" |
-            Set-Content golang.dockerfile
 
-        docker build -t golang:windowsservercore-$WinVer -t golang:windowsservercore-latest -t golang:latest -f golang.dockerfile .
+        ######################################################################################################################
+        #
+        # If a reboot was required, this cmdlet will reach here; Unregister the resumption scheduled task if one was created.
+        #
+        ######################################################################################################################
+        $Task = Get-ScheduledTask -TaskName 'KubernetesNodeBootstrap' -ErrorAction SilentlyContinue
+        if ($Task) {
+            $Task | Unregister-ScheduledTask -Confirm:$False
+            Write-Host 'Unregistered KubernetesNodeBootstrap scheduled task, as all prerequisite setup has been completed.'
+        }
 
-        # Build custom Flannel image, update default flannel-overlay.yml, and apply it to the cluster
-        Invoke-RestMethod -Method GET -Uri 'https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/flannel/Dockerfile' -Outfile kube-flannel.dockerfile
-        docker build --build-arg serverCoreTag=$WinVer --build-arg cniVersion=$Script:Config.Cni.Version --build-arg golangTag=windowsservercore-$WinVer -t kubeletwin/flannel:$($Script:Config.Cni.Plugin.Version)-windowsservercore-$WinVer -t kubeletwin/flannel:$($Script:Config.Cni.Plugin.Version) -t kubeletwin/flannel:latest -f kube-flannel.dockerfile .
 
-        $FlannelYmlName = "flannel-$(if ($Script:Config.Cni.NetworkMode -ieq 'overlay') { 'overlay' } else { 'host-gw' }).yml"
-        $FlannelYml = Invoke-RestMethod -Method GET -Uri "https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/flannel/$FlannelYmlName"
-        # This code does not yet support host-gw...
-        $FlannelYml -replace 'sigwindowstools/flannel:\d+\.\d+\.\d+$', "kubeletwin/flannel:$($Script:Config.Cni.Plugin.Version)-windowsservercore-$WinVer"
-        Set-Content -Path $FlannelYmlName -Value $FlannelYml
-        scp -o StrictHostKeyCHecking=no $FlannelYmlName "$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443'):~/$FlannelYmlName"
-        ssh "$($Script:Config.Kubernetes.ControlPlane.Username):$($Script:Config.Kuberenetes.ControlPlane.Address -replace ':6443')" "kubectl apply -f $FlannelYmlName"
-        
-        # Build custom Kube-Proxy image, update default kube-proxy.yml, and apply it to the cluster
-        Invoke-RestMethod -Method GET -Uri 'https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/kube-proxy/Dockerfile' -Outfile kube-proxy.dockerfile
-        docker build --build-arg k8sVersion=v$($Script:Config.Kubernetes.Version) --build-arg servercoreTag=$WinVer -t kubeletwin/kube-proxy:$($Script:Config.Kubernetes.Version)-windowsservercore-$WinVer -t kubeletwin/kube-proxy:$($Script:Config.Kubernetes.Version) -t kubeletwin/kube-proxy:latest -f kube-proxy.dockerfile .
+        # >>>>> TODO: Get rid of this??
+        Get-HnsScriptModule -Path $Script:KubernetesClusterNodeInstallationPath
+        $null = Import-Module "$Script:KubernetesClusterNodeInstallationPath\hns.psm1" -DisableNameChecking
 
-        $KubeProxyYml = Invoke-RestMethod -Method GET -Uri "https://raw.githubusercontent.com/kubernetes-sigs/sig-windows-tools/master/kubeadm/kube-proxy/kube-proxy.yml"
-        $KubeProxyYml -replace 'sigwindowstools/kube-proxy:VERSION$', "kubeletwin/kube-proxy:$($Script:Config.Kubernetes.Version)-windowsservercore-$WinVer"
-        Set-Content -Path kube-proxy.yml -Value $KumePlobyYml
-        scp -o StrictHostKeyCHecking=no kube-proxy.yml "$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443'):~/kube-proxy.yml"
-        ssh "$($Script:Config.Kubernetes.ControlPlane.Username):$($Script:Config.Kuberenetes.ControlPlane.Address -replace ':6443')" "kubectl apply -f kube-proxy.yml"
-    }
-    # !!!!! END BUILD ANY REQUIRED DOCKER IMAGES
+        # >>>>> TODO: This should probably be moved into its own cmdlet (probably private cmdlet)
+        ######################################################################################################################
+        #
+        # Setup SSH Key
+        #
+        ######################################################################################################################
+        $SshKeyFile = Join-Path (Join-Path $env:USERPROFILE '.ssh') 'id_rsa'
+        # If the current user's public SSH key is not detected...
+        if (!(Test-Path $SshKeyFile)) {
+            # If running interactively...
+            if (!($Force -and $Force.IsPresent)) {
+                $resp = Read-HostEx "Do you wish to generate a SSH Key and add it to the Linux control-plane node? [Y/n] (Default 'Y') " -ExpectedValue 'Y','n'
+                if (!$resp -or $resp -ieq 'y') {
+                    Write-Host "Please follow the on-screen prompts to generate a SSH key and copy your public SSH key to the Linux control plane."
+                    New-SshKey
+                    @'
+Host k8s-master
+    AddKeysToAgent yes
+    IdentitiesOnly yes
+'@ | Set-Content -Path (Join-Path (Join-Path $env:USERPROFILE .ssh) config)
 
-    # !!!!! TODO: GET RID OF CONTAINER BUILDING AND RETRIEVAL PARAMETERS
-    $InstallCriParams = @{
-        NanoServerImage = "$($Script:Config.Images.NanoServer)"
-        ServerCoreImage = "$($Script:Config.Images.ServerCore)"
-    }
-    if ($Script:Config.Images.Pause.Build) {
-        $InstallCriParams += @{ PauseDockerfile = $Script:Config.Images.Pause.Dockerfile }
-    } else {
-        $InstallCriParams += @{ PauseImage = "$($Script:Config.Images.Pause.Image)" }
-    }
-    Install-ContainerRuntimeInterface -Name $Script:Config.Cri.Name -Force:$Force @InstallCriParams
-    Get-KubernetesBinaries -Version $Script:Config.Kubernetes.Version
-    Get-CniBinaries -Version $Script:Config.Cni.Version -NetworkMode $Script:Config.Cni.NetworkMode -PluginName $Script:Config.Cni.Plugin.Name -PluginVersion $Script:Config.Cni.Plugin.Version
+                    # Set the proper ACLs on the key file, or SSH won't let you copy it
+                    icacls.exe $SshKeyFile /c /t /Inheritance:d
+                    icacls.exe $SshKeyFile /c /t /Grant ${env:USERNAME}:F
+                    icacls.exe $SshKeyFile /c /t /Remove Administrator "Authenticated Users" BUILTIN\Administrator BUILTIN Everyone System Users
 
-    <#
-    if (!(Test-Path (Join-Path (Join-Path $env:USERPROFILE '.ssh') 'id_rsa.pub'))) {
-        if (!($Force -and $Force.IsPresent)) {
-            $resp = Read-HostEx "Do you wish to generate a SSH Key and add it to the Linux control-plane node? [Y/n] (Default 'Y') "
+                    # Add the key to the SSH Agent to enable passwordless, key-based authentication
+                    Ssh-Add $SshKeyFile
+
+                    # Copy the public key to the Linux Kubernetes control plane master
+                    $CopySshKeyParams = @{
+                        PublicSshKeyPath = "$SshKeyFile.pub"
+                        RemoteUsername = $Script:Config.Kubernetes.ControlPlane.Username
+                        RemoteHostname = $Script:Config.Kubernetes.ControlPlane.Address -replace ':6443'
+                    }
+                    Copy-SshKey @CopySshKeyParams
+                }
+            } else <# Running unattended #> {
+                $MachinePublicSshKeyPath = Join-Path (Join-Path $env:ALLUSERSPROFILE .ssh) id_rsa
+                New-SshKey -Destination $MachinePublicSshKeyPath -PassPhrase ''
+                Write-Host "Generated a machine SSH key."
+                ssh-keyscan.exe "$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443')" 2>$null | Out-File (Join-Path (Join-Path $env:USERPORFILE '.ssh') 'known_hosts')
+                Write-Host "Added the Kubernetes master node as a SSH ""known host""."
+                Write-Host
+
+                Write-Warning @"
+
+Before joining this server to the Kubernetes cluster, please execute one of the following commands on the Linux
+Kubernetes master control-plane node '$($Config.Kubernetes.ControlPlane.Address -replace ':6443')' to add this Windows node's public key to the
+"authorized keys file:
+
+    echo $(Get-Content "${MachinePublicSshKeyPath}.pub" -Raw) >> ~/.ssh/authorized_keys"
+
+Alternatively, execute the following command from another PowerShell shell on this machine to copy this Windows node's
+public SSH key to the Linux Kubernetes master control plane:
+
+    Copy-SshKey -PublicSshKeyPath $MachinePublicSshKeyPath.pub -RemoteUsername $($Script:Config.Kubernetes.ControlPlane.Username) -RemoteHostname $($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443')
+
+"@
+            }
+        } else <# The user's public SSH key was detected #> {
+            # If running interacitevly..."
+            if (!($Force -and $Force.IsPresent)) {
+                Write-Host "A public SSH key file has been detected."
+                Write-Host
+                Write-Host "Your public SSH key can be used to connect to the Linux Kubernetes control plane in order to remotely configure it as"
+                Write-Host "part of setting up this Windows Server as a Kubernetes worker node."
+                Write-Host
+                Write-host "If you do not copy your public SSH key to the Linux Kubernetes control plane, you will need to do so before joining"
+                Write-Host "this server as a worker node to the Kubernetes cluster."
+                Write-Host
+                Write-Host "If you have already copied your public SSH key to the Linux Kubernetes contrtol plane, you can safely answer 'N' when"
+                Write-Host "asked to copy your public SSH key."
+                Write-Host
+                $resp = Read-HostEx "Do you want to copy your public SSH key to the Linux Kubernetes control plane now? [Y/n] (Default 'Y') " -ExpectedValue 'Y','n'
+            } else <# running unattended #> {
+                $resp = 'n'
+            }
+            
+            $SshKeyFile = Join-Path (Join-Path $env:USERPROFILE .ssh) id_rsa
             if (!$resp -or $resp -ieq 'y') {
-                New-SshKey
+                Write-Host "Please follow the on-screen prompts to copy your public ssh key to the Linux Kubernetes master control plane."
+                @'
+Host k8s-master
+    AddKeysToAgent yes
+    IdentitiesOnly yes
+'@ | Set-Content -Path (Join-Path (Join-Path $env:USERPROFILE .ssh) config)
 
-                Write-Host "When prompted, please enter your SSH passphrase in order to copy your public SSH key to the Linux control-plane."
-                Copy-SshKey -
-            }   
+                # Set the proper ACLs on the key file, or SSH won't let you copy it
+                icacls.exe $SshKeyFile /c /t /Inheritance:d
+                icacls.exe $SshKeyFile /c /t /Grant ${env:USERNAME}:F
+                icacls.exe $SshKeyFile /c /t /Remove Administrator "Authenticated Users" BUILTIN\Administrator BUILTIN Everyone System Users
+
+                # Add the key to the SSH Agent to enable passwordless, key-based authentication
+                Ssh-Add $SshKeyFile
+
+                # Copy the public key to the Linux Kubernetes control plane master
+                $CopySshKeyParams = @{
+                    PublicSshKeyPath = "$SshKeyFile.pub"
+                    RemoteUsername = $Script:Config.Kubernetes.ControlPlane.Username
+                    RemoteHostname = $Script:Config.Kubernetes.ControlPlane.Address -replace ':6443'
+                }
+                Copy-SshKey @CopySshKeyParams
+            } else {
+                Write-Warning @"
+
+Before joining this server to the Kubernetes cluster, please add your public SSH key to the Linux master control plane
+node by executing the following command:
+
+    @'
+        Host k8s-master
+            AddKeysToAgent yes
+            IdentitiesOnly yes
+    '@ | Set-Content -Path $SshKeyPath
+    ssh-add $SshKeyPath
+    Copy-SshKey -PublicSshKeyPath $SshKeyPath.pub -RemoteUsername $($Script:Config.Kubernetes.ControlPlane.Username) -RemoteHostname $($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443')
+
+
+"@
+            }
+        }
+
+        ######################################################################################################################
+        #
+        # Install the Container Runtime Interface (CRI): one of dockerd or containerd
+        #
+        ######################################################################################################################
+        Install-ContainerRuntimeInterface -Name $Script:Config.Cri.Name -Force:$Force
+
+        ######################################################################################################################
+        #
+        # Get the required Kuberenetes binaries
+        #
+        ######################################################################################################################
+        Get-KubernetesBinaries -Version $Script:Config.Kubernetes.Version -Force:$Force
+
+        ######################################################################################################################
+        #
+        # Get the required Container Network Interface (CNI) binaries
+        #
+        ######################################################################################################################
+        Get-CniBinaries -Version $Script:Config.Cni.Version -NetworkMode $Script:Config.Cni.NetworkMode -PluginName $Script:Config.Cni.Plugin.Name -PluginVersion $Script:Config.Cni.Plugin.Version -Force:$Force
+
+
+        ######################################################################################################################
+        #
+        # Get Required Windows Server Docker Container Images
+        #
+        ######################################################################################################################
+        Write-Host "Pulling required docker images. This could take a while..."
+        @(
+            $Script:Config.Images.NanoServer
+            $Script:Config.Images.ServerCore
+            $Script:Config.Images.Infrastructure.Pause
+        ) | Get-DockerImage
+        Write-Host "Docker images pulled."
+
+
+        ######################################################################################################################
+        #
+        # Build any required custom infrastructure images and configure Windows networking for the Kubernetes cluster
+        #
+        ######################################################################################################################
+        if (!$Script:Config.Images.Infrastructure.Build) {
+            if (!($Force -and $Force.IsPresent)) {
+                Write-Warning @"
+
+If you haven't already configured Windows networking on the Kubernetes master control plane, please do so BEFORE joining this
+server to the cluster.
+
+Execute the following commands on the Linux Kubernetes master control plane:
+
+    curl -L https://github.com/kubernetes-sigs/sig-windows-tools/releases/latest/download/kube-proxy.yml | sed 's/VERSION/v$($Script:Config.Kubernetes.Version)/g' | kubectl apply -f -
+    kubectl apply -f https://github.com/kubernetes-sigs/sig-windows-tools/releases/latest/download/flannel-overlay.yml
+
+
+"@
+            } else {
+                # If we don't need any custom infrastructure images, just configure the Kubernetes master control plane node for
+                # Windows node networking using unmodified YAML configuration files
+                @(
+                    $Script:Config.Cni.Plugin.WindowsNodeConfigurationUrl,
+                    $Script:Config.Kubernetes.KubeProxy.WindowsNodeConfigurationUrl
+                ) | ForEach-Object {
+                    $OutFile = Split-Path $_ -Leaf
+                    Invoke-RestMethod -Method GET -Uri $_ -OutFile $OutFile
+
+                    if ($OutFile -imatch 'kube-proxy') {
+                        (Get-Content $OutFile -Raw) -replace '(image: sigwindowstools/kube-proxy:)VERSION$',"`${1}v$($Script:Config.Kubernetes.Version)" |
+                            Set-Content $OutFile
+                    }
+
+                    if ((Test-Path $env:USERPROFILE\.ssh\id_rsa) -and (ssh-agent -L) -match "(?m)\s+$($env:USERPROFILE -replace '\\','\\')\\\.ssh\\id_rsa$") {
+                        $resp = Read-HostEx @"
+If your SSH key has been copied to and authorized on the Linux Kubernetes master control plane node, do yo uwant to
+copy Kubernetes configuration files to the master node and configure the Kubernetes cluster in order to join this
+server to the cluster as a worker node? [Y|n] (Default 'Y') 
+"@
+                        if (!$resp -or $resp -ieq 'y') {
+                            scp -o StrictHostKeyChecking=no $OutFile "$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443'):~/$OutFile"
+                            ssh -T "$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443')" kubectl apply -f $OutFile
+                        } else {
+                            Write-Warning @"
+Before you can run Join-KubernetesCluster on this node, you must perform the following commands to configure the
+cluster to run this server as a worker node:
+
+    scp -o StrictHostKeyChecking=no flannel-overlay.yml "$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443'):~/flannel-overlay.yml"
+    scp -o StrictHostKeyChecking=no kube-proxy.yml "$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443'):~/kube-proxy.yml"
+    ssh -T "$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443')" kubectl apply -f flannel-overlay.yml
+    ssh -T "$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443')" kubectl apply -f kube-proxy.yml
+
+"@
+                        }
+                    }
+                }
+            }
         } else {
-            Write-Host "Generating SSH key ..."
-            New-SshKey -PassPhrase ''
-            cmd /c "ssh-keyscan.exe $($Script:Config.Kubernetes.ControlPlane.MasterAddress) 2>NUL" | Out-File -Encoding Utf8 (Join-Path (Join-Path $env:USERPORFILE '.ssh') 'known_hosts')
-        }
-    } else {
-        Write-Host "If you haven't already copied your public SSH key to the Linux control-plane, please do so before joining this server to the Kubernetes cluster."
-        Write-Host "Execute the following commands on the Linux control-plane node '$($Config.Kubernetes.ControlPlane.MasterAddress)' to add this Windows"
-        Write-Host "node's public key to the authorized keys file:"
-        Write-Host
-        Write-Host "    echo $(Get-Content (Join-Path (Join-Path $env:USERPROFILE .ssh) id_rsa.pub) -Raw) >> ~/.ssh/authorized_keys"
-        Write-Host
-        Write-Host "Alternatively, execute the following command from another PowerShell shell on this machine:"
-        Write-Host
-        Write-Host "    Copy-SshKey -RemoteUsername $($Script:Config.Kubernetes.ControlPlane.MasterUsername) -RemoteHostname $($Script:Config.Kubernetes.ControlPlane.MasterAddress)"
-        Write-Host
-    }
-    #>
+            # Otherwise, build custom networking container images and modify the YAML configuration files to use these
+            # custom docker container images when the node is joined to the cluster.
+            Write-Host "The detected version of windows is v$Script:WinVer."
+            Write-Host
+            Write-Host "To setup this computer as a Kubernetes cluster node, custom docker container images are required because the current"
+            Write-Host "version of Windows is not one of Windows Server LTSC2019 (1809), 1903, or 1909."
+            Write-Host
+            Write-Host "Docker on Windows requires that Windows-based Docker container images' base Windows operating system must match the host"
+            Write-Host "operating system. Otherwise, the container will not start."
+            
+            New-KubernetesPauseContainerImage $Script:Config.Images.Infrastructure.PauseDockerfile -Force:$Force -ErrorAction Stop
+            Write-Host "Built custom Kubernetes infrastructure container image 'kubeletwin/pause'."
 
-    $Task = Get-ScheduledTask -TaskName 'KubernetesNodeBootstrap' -ErrorAction SilentlyContinue
-    if ($Task) {
-        $Task | Unregister-ScheduledTask -Confirm:$False
-        Write-Host 'Unregistered KubernetesNodeBootstrap scheduled task, as all prerequisite setup has been completed.'
-    }
+            $GoLangVersionMetadata = Get-GoLangVersionMetadata
 
-    if (!($Force -and $Force.IsPresent)) {
-        $resp = Read-HostEx "Would you like to join this server to the Kubernetes cluster now? [y/N] (Default 'N') " -ExpectedValue 'y','N'
-        if ($resp -ieq 'Y') {
-            Join-KubernetesCluster
+            New-GoLangContainerImage -GoLangVersionMetadata $GoLangVersionMetadata -Force:$Force -ErrorAction Stop
+            Write-Host "Built custom Golang docker container image."
+
+            if ($Script:Config.Cni.Plugin.Name -eq 'flannel') {
+                $FlannelContainerImageParams = @{
+                    GoLangDockerImageTag = "$($goLangVersionMetadata.Version)-windowsservercore-$Script:WinVer"
+                    FlannelDockerfile = $Script:Config.Images.Infrastructure.FlannelDockerfile
+                    FlannelVersion = $Script:Config.Cni.Plugin.Version
+                    CniVersion = $Script:Config.Cni.Version
+                    Force = $Force
+                }
+                New-KubernetesFlannelContainerImage -ErrorAction Stop @FlannelContainerImageParams
+                Write-Host "Built custom Kubernetes Windows flannel docker container networking image."
+            }
+
+            New-KubernetesKubeProxyContainerImage -KubeProxyDockerfile $Script:Config.Images.Infrastructure.KubeProxyDockerfile -KubernetesVersion $Script:Config.Kubernetes.Version -Force:$Force -ErrorAction Stop
+            Write-Host "Built custom Kubernetes kube-proxy docker container image."
+
+            @(
+                $Script:Config.Cni.Plugin.WindowsNodeConfigurationUrl,
+                $Script:Config.Kubernetes.KubeProxy.WindowsNodeConfigurationUrl
+            ) | ForEach-Object {
+                $ConfigurationUrl = $_
+                $Outfile = Split-Path $_ -Leaf
+
+                switch ($Outfile) {
+                    'flannel-overlay.yml' {
+                        (Invoke-RestMethod -Method GET -Uri $ConfigurationUrl) `
+                            -replace '(?m)sigwindowstools/flannel:\d+\.\d+\.\d+$', @"
+kubeletwin/flannel:$($Script:Config.Cni.Plugin.Version)-windowsservercore-$Script:WinVer
+        imagePullPolicy: Never
+"@ |
+                            Set-Content $Outfile
+                        break;
+                    }
+                    'kube-proxy.yml' {
+                        (Invoke-RestMethod -Method GET -Uri $ConfigurationUrl) `
+                            -replace '(?m)sigwindowstools/kube-proxy:VERSION$', @"
+kubeletwin/kube-proxy:$($Script:Config.Kubernetes.Version)-windowsservercore-$Script:WinVer
+        imagePullPolicy: Never
+"@ |
+                            Set-Content $Outfile
+                        break;
+                    }
+
+                    default {
+                        Invoke-RestMethod -Method GET -Uri $ConfigurationUrl -OutFile $OutFile
+                        break;
+                    }
+                }
+
+                if (!($Force -and $Force.IsPresent)) {
+                    scp -o StrictHostKeyCHecking=no $OutFile "$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443'):~/$OutFile"
+                    ssh -T "$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443')" kubectl apply -f $OutFile
+                }
+            }
+
+            if ($Force -and $Force.IsPresent) {
+                Write-Warning @"
+
+If you haven't already configured Windows networking on the Kubernetes master control plane, please do so BEFORE joining this
+server to the cluster.
+
+Execute the following commands from this server against the Linux Kubernetes master control plane:
+
+    $(
+        @(
+            Split-Path $Script:Config.Cni.Plugin.WindowsNodeConfigurationUrl -Leaf
+            Split-Path $Script:Config.Kubernetes.KubeProxy.WindowsNodeConfigurationUrl -Leaf
+        ) | ForEach-Object {
+            "    scp -o StrictHostKeyChecking=no $(Join-Path $PWD $_) `"$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443'):~/$_`"`n"
+            "    ssh -T `"$($Script:Config.Kubernetes.ControlPlane.Username)@$($Script:Config.Kubernetes.ControlPlane.Address -replace ':6443')`" kubectl apply -f $_"
         }
-    } else {
-        Write-Host 'When you''re ready to join this server to the Kubernetes cluster, plesee execute the following commands:'
-        Write-Host
-        Write-Host '    Import-Module WindowsKubernetesWorkerNode'
-        Write-Host '    Join-KubernetesCluster'
-        Write-Host
+    )
+
+
+"@
+            }
+        }
+
+        ######################################################################################################################
+        #
+        # Create Docker NAT network 'host' and set scheduled task to recreate the network on restarts of the server
+        #
+        ######################################################################################################################
+        if (!(docker network ls -f name=host -q)) {
+            docker network create -d nat host
+
+            if (!(docker network ls -f name=host -q)) {
+                Write-Error 'Failed to create Docker NAT network ''host''.'
+            }
+        }
+
+        if (!(Get-ScheduledTask -TaskName 'Create Docker NAT network ''host''' -ErrorAction SilentlyContinue)) {
+            # Windows does not persist "custom" Docker NAT networks between server restarts. But Kubernetes requires
+            # this network to exist. So register a scheduled task that ensures this network is created on restarts.
+            Register-DockerHostNetworkCreationScheduleTask
+        }
+        
+        if (!($Force -and $Force.IsPresent)) {
+            $resp = Read-HostEx "`nnWould you like to join this server to the Kubernetes cluster now? [y/N] (Default 'N') " -ExpectedValue 'y','N'
+            if ($resp -ieq 'Y') {
+                Join-KubernetesCluster
+            }
+        } else {
+            Write-Host 'When you''re ready to join this server to the Kubernetes cluster, plesee execute the following commands:'
+            Write-Host
+            Write-Host '    Import-Module WindowsKubernetesWorkerNode'
+            Write-Host '    Join-KubernetesCluster'
+            Write-Host
+        }
+    } finally {
+        Set-Location $Script:Cwd
     }
 }
 
@@ -2042,6 +2479,47 @@ function Read-HostEx {
     } while ((!$Response -and $ValueRequired -and $ValueRequired.IsPresent) -or ($Response -and $Response -inotin $ExpectedValue))
 
     $Response
+}
+
+<#
+.SYNOPSIS
+    Sets up a scheduled task to run when the server starts up to create a Docker NAT network named 'host'.
+
+.DESCRIPTION
+
+    Windows is lame in that custom NAT networks which are created, particularly for Docker, are not
+    persisted between reboots. When setting up a Kubernetes cluster, an address space is provided froh which
+    Pods and containers are given IP addresses, usually as part of a NAT network. The default Docker NAT
+    network 'nat' could be modified, but I haven't found how to do that. 
+
+    Instead, this cmdlet will setup a scheduled task to ensure the Docker 'host' NAT network is created
+    once docker is running.
+
+#>
+function Register-DockerHostNetworkCreationScheduleTask {
+    $Command = '{ $DockerSvc = Get-Service docker; while ($DockerSvc.Status -ne ''Running'') { Write-Info ''Waiting for docker to start...''; Start-Sleep -Seconds 1; $DockerSvc.Refresh(); }; if (!(docker network ls -f name=host -q)) { docker network create -d nat host }; if (!(docker network ls -f name=host -q)) { Write-Error ''Failed to create ''''host'''' Docker NAT network!'' } else { Write-Information ''Successfully created ''''host'''' Docker NAT network.'' }; }'
+    $Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoLogo -NoProfile -NonInteractive -Command {0}' -f $Command)
+    $Trigger = New-ScheduledTaskTrigger -AtStartup
+    $null = Register-ScheduledTask -TaskName 'Create Docker NAT network ''host''' -Description 'Upon startup, once Docker is running, creates a Docker NAT network named ''host''. Windows does not persist custom Docker NAT networks between reboots.' -Action $Action -Trigger $Trigger -RunLevel Highest
+}
+
+function Register-KubernetesNodeInstallationResumptionScheduledTask {
+    $MyArgs = $MyInvocation.Line -replace $MyInvocation.InvocationName
+    $MyCommand = $MyInvocation.MyCommand.Name
+    $MyModule = $MyInvocation.MyCommand.ModuleName
+
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-ExecutionPolicy Bypass { Import-Module '$MyModule'; $MyCommand $MyArgs }" -WorkingDirectory $pwd
+    Write-Output "Created scheduled task action to resume kubernetes node installation after reboot."
+
+    try {
+        $trigger = New-ScheduledTaskTrigger -AtLogOn
+        Write-Output "Cretaed a scheduled task trigger to execute the task action at the next logon."
+
+        $null = Register-ScheduledTask -TaskName "KubernetesNodeBootstrap" -Action $action -Trigger $trigger -RunLevel Highest
+        Write-Host "Registered the scheduled task."
+    } catch {
+        throw
+    }
 }
 
 function Remove-Containers { docker ps -aq | ForEach-Object { docker rm $_ -f } }
@@ -2115,6 +2593,8 @@ function Set-CniConfiguration {
     Param (
         [string] $Path = $Script:CniConfigurationPath,
 
+        [string] $CriName = 'dockerd',
+
         [string] $NodeIpAddress = (Get-InterfaceIpAddress),
 
         [string] $NodeSubnet = (Get-InterfaceSubnet),
@@ -2185,7 +2665,7 @@ function Set-CniConfiguration {
             $OutboundNatExceptions[1] = $ServiceCIDR
             $OutboundNatExceptions[2] = $NodeSubnet
 
-            if ($Script:Config.Cri -ieq 'dockerd') {
+            if ($CriName -ieq 'dockerd') {
                 $CniConfig.delegate.policies[1].Value.DestinationPrefix = $ServiceCIDR
                 $CniConfig.delegate.policies[2].Value.DestinationPrefix = "${NodeIPAddress}/32"
             } else {
@@ -2250,9 +2730,10 @@ function Set-CniConfiguration {
             $OutboundNatExceptions[0] = $ClusterCIDR
             $OutboundNatExceptions[1] = $ServiceCIDR
 
-            if ($Config.Cri -ieq 'dockerd') {
-                $CniConfig.delegate.policies[0].Value.DestinationPrefix = $ServiceCIDR
+            if ($CriName -ieq 'dockerd') {
+                $CniConfig.delegate.policies[1].Value.DestinationPrefix = $ServiceCIDR
             } else {
+                Write-Error "SHOULDN'T BE HERE!!!"
                 $CniConfig.capabilities = $CniConfig.capabilities | Add-Member -MemberType NoteProperty -Name 'portMappings' -Value $True -PassThru
                 $CniConfig.delegate.type = 'sdnoverlay'
 
@@ -2276,22 +2757,24 @@ function Set-CniConfiguration {
         if (!(Test-Path $Folder)) {
             $null = New-Item -ItemType Directory $Folder
         }
+
+        $CniConfigJson = ConvertTo-JSON $CniConfig -Depth 100
         
-        Set-Content -Path $Path -Value (ConvertTo-JSON $CniConfig -Depth 100) -Force
+        Set-Content -Path $Path -Value $CniConfigJson -Force
         
-        Write-Host "Generated CNI configuration:`r`n`r`n$CniConfig`r`n`r`n"
+        Write-Host "Generated CNI configuration:`r`n`r`n$CniConfigJson`r`n`r`n"
     }
 }
 
-function Set-KubernetesClusterNodeConfiguration {
+function Set-KubernetesWindowsNodeConfiguration {
     [CmdletBinding()]
     [OutputType([Boolean])]
     Param (
         [Parameter(Position = 0)]
-        [string] $Path = (Join-Path (Join-Path $env:ALLUSERSPROFILE 'Kubernetes') '.kubeclusternodeconfig'),
+        [string] $Path = (Join-Path (Join-Path $env:ALLUSERSPROFILE 'Kubernetes') '.kubewindowsnodeconfig'),
 
         [Parameter(ValueFromPipeline)]
-        [PSTypeName('KubernetesClusterNodeConfiguration')]
+        [PSTypeName('KubernetesWindowsNodeConfiguration')]
         [PSCustomObject] $Config = $Script:Config,
 
         [switch] $Force
@@ -2323,7 +2806,7 @@ function Set-KubernetesClusterNodeConfiguration {
 
 function Set-NetConfig {
     Param (
-        [string] $Path = $Script:CniNetworkConfigurationPath,
+        [string] $Path = $Script:NetworkConfigurationPath,
 
         [string] $ClusterCIDR = '10.244.0.0/16',
 
@@ -2352,9 +2835,11 @@ function Set-NetConfig {
             $NetConfig.Backend.type = 'vxlan'
         }
 
-        Set-Content -Path $Path -Value (ConvertTo-JSON $NetConfig -Depth 100)
+        $NetConfigJson = ConvertTo-JSON $NetConfig -Depth 100
+
+        Set-Content -Path $Path -Value $NetConfigJson
         
-        Write-Host "Generated net-conf Config:`r`n`r`n$NetConfig`r`n`r`n"
+        Write-Host "Generated net-conf Config:`r`n`r`n$NetConfigJson`r`n`r`n"
     }
 }
 
@@ -2449,48 +2934,69 @@ function Uninstall-KubeProxy {
     }
 }
 
-function Write-KubernetesClusterNodeConfiguration {
+function Write-KubernetesWindowsNodeConfiguration {
     [CmdletBinding()]
     Param(
         [Parameter(ValueFromPipeline)]
-        [PSTypeName('KubernetesClusterNodeConfiguration')]
+        [PSTypeName('KubernetesWindowsNodeConfiguration')]
         [PSCustomObject] $Config = $Script:Config
     )
 
-    Write-Host
-    Write-Host '########################################################################################################################'
-    Write-Host
-    Write-Host 'This is the Kubernetes Cluster Node Configuration data which will be used to configure this node:'
-    Write-Host
-    Write-Host "    Container Runtime Interface: $($Script:Config.Cri.Name)"
-    Write-Host '    Container Network Interface:'
-    Write-Host "        Mode:    $($Script:Config.Cni.NetworkMode)"
-    Write-Host "        Name:    $($Script:Config.Cni.NetworkName)"
-    Write-Host "        Version: $($Script:Config.Cni.Version)"
-    Write-Host "        Plugin:  $($Script:Config.Cni.Plugin.Name) v$($Script:Config.Cni.Plugin.Version)"
-    Write-Host '    Kubernetes:'
-    Write-Host "        Version: v$($Script:Config.Kubernetes.Version)"
-    Write-Host '        Control Plane Information:'
-    Write-Host "            Master Node Address: $($Script:Config.Kubernetes.ControlPlane.Address)"
-    Write-Host "            Username:            $($Script:Config.Kubernetes.ControlPlane.Username[0])$("*" * 8)$($Script:Config.Kubernetes.ControlPlane.Username[-1])"
-    Write-Host "            Join Token:          $("*" * ($Script:Config.Kubernetes.ControlPlane.JoinToken.Length - 4))$($Script:Config.Kubernetes.ControlPlane.JoinToken.Substring($Script:Config.Kubernetes.ControlPlane.JoinToken.Length - 4))"
-    Write-Host "            CA Hash:             $("*" * ($Script:Config.Kubernetes.ControlPlane.CAHash.Length - 8))$($Script:Config.Kubernetes.ControlPlane.CAHash.Substring($Script:Config.Kubernetes.ControlPlane.CAHash.Length - 8))"
-    Write-Host '        Network Information:'
-    Write-Host "            Cluster CIDR:           $($Script:Config.Kubernetes.Network.ClusterCIDR)"
-    Write-Host "            Service CIDR:           $($Script:Config.Kubernetes.Network.ServiceCIDR)"
-    Write-Host "            DNS Service IP Address: $($Script:Config.Kubernetes.Network.DnsService.IPAddress)"
-    Write-Host '    Node Interface Information:'
-    Write-Host "        Name:            $($Script:Config.Node.InterfaceName)"
-    Write-Host "        IP Address:      $($Script:Config.Node.IPAddress)"
-    Write-Host "        Subnet:          $($Script:Config.Node.Subnet)"
-    Write-Host "        Default Gateway: $($Script:Config.Node.DefaultGateway)"
-    Write-Host '    Docker Images:'
-    Write-Host "        Nano Server Image: $($Script:Config.Images.NanoServer)"
-    Write-Host "        Server Core Image: $($Script:Config.Images.ServerCore)"
-    Write-Host '        Pause Image:'
-    Write-Host "            Build? $(if ($Script:Config.Images.Pause.Build) { '     Yes' } else  { 'No' })"
-    Write-Host "            $(if ($Script:Config.Images.Pause.Build) { "Dockerfile: $($Script:Config.Images.Pause.Dockerfile)" } else { "Image:      $($Script:Config.Images.Pause.Image)" })"
-    Write-Host
-    Write-Host "########################################################################################################################"
-    Write-Host
+    Write-Host @"
+########################################################################################################################
+
+This is the Kubernetes Cluster Node Configuration data which will be used to configure this node:
+
+    Container Runtime Interface: $($Config.Cri.Name)
+    Container Network Interface:
+        Mode:    $($Config.Cni.NetworkMode)
+        Name:    $($Config.Cni.NetworkName)
+        Version: $($Config.Cni.Version)
+        Plugin:  $($Config.Cni.Plugin.Name) v$($Config.Cni.Plugin.Version)
+    Kubernetes:
+        Version: v$($Config.Kubernetes.Version)
+        Control Plane Information:
+            Master Node Address: $($Config.Kubernetes.ControlPlane.Address)
+            Username:            $($Config.Kubernetes.ControlPlane.Username[0])$("*" * 8)$($Config.Kubernetes.ControlPlane.Username[-1])
+            Join Token:          $("*" * ($Config.Kubernetes.ControlPlane.JoinToken.Length - 4))$($Config.Kubernetes.ControlPlane.JoinToken.Substring($Config.Kubernetes.ControlPlane.JoinToken.Length - 4))
+            CA Hash:             $("*" * ($Config.Kubernetes.ControlPlane.CAHash.Length - 8))$($Config.Kubernetes.ControlPlane.CAHash.Substring($Config.Kubernetes.ControlPlane.CAHash.Length - 8))
+        Network Information:
+            Cluster CIDR:           $($Config.Kubernetes.Network.ClusterCIDR)
+            Service CIDR:           $($Config.Kubernetes.Network.ServiceCIDR)
+            DNS Service IP Address: $($Config.Kubernetes.Network.DnsService.IPAddress)
+    Node Interface Information:
+        Name:            $($Config.Node.InterfaceName)
+        IP Address:      $($Config.Node.IPAddress)
+        Subnet:          $($Config.Node.Subnet)
+        Default Gateway: $($Config.Node.DefaultGateway)
+    Docker Images:
+        Nano Server Image: $($Config.Images.NanoServer)
+        Server Core Image: $($Config.Images.ServerCore)
+        Infrastructure Images:
+            Build? $(if ($Config.Images.Infrastructure.Build) { '                Yes' } else  { 'No' })
+$(if ($Config.Images.Infrastructure.Build) {
+    "            Flannel Dockerfile:    $($Config.Images.Infrastructure.FlannelDockerfile)`n"
+    "           Kube-Proxy Dockerfile: $($Config.Images.Infrastructure.KubePRoxyDockerfile)`n"
+    "           Pause Dockerfile:      $($Config.Images.Infrastructure.PauseDockerfile)"
+} else {
+    "            Pause: $($Config.Images.Infrastructure.Pause)"
+})
+
+########################################################################################################################
+
+"@
 }
+
+[PSTypeName('KubernetesWindowsNodeConfiguration')]
+[PsCustomObject] $Script:Config = [PSCustomObject] $null
+
+[string] $Script:Cwd = Get-Location
+[string] $Script:WinVer = Get-WindowsBuildVersion
+[string] $Script:KubernetesClusterNodeInstallationPath = Join-Path $env:ALLUSERSPROFILE 'Kubernetes'
+[string] $Script:KubernetesClusterNodeConfigurationPath = Join-Path $KubernetesClusterNodeInstallationPath '.kubewindowsnodeconfig'
+[string] $Script:KubernetesClusterNodeLogPath = Join-Path $Script:KubernetesClusterNodeInstallationPath 'logs'
+[string] $Script:CniPath = Join-Path $Script:KubernetesClusterNodeInstallationPath 'cni'
+[string] $Script:CniConfigurationPath = Join-Path (Join-Path $Script:CniPath 'config') 'cni.conf'
+[string] $Script:NetworkConfigurationPath = Join-Path $Script:KubernetesClusterNodeInstallationPath 'net-conf.json'
+
+$ProgressPreference = 'SilentlyContinue'
