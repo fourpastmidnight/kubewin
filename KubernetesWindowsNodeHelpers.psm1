@@ -157,11 +157,10 @@ function ValidateKubernetesWindowsNodeConfiguration {
                 $Errors += 'Missing ''Cni.Plugin.Version''.'
             }
 
-            $WinVer = Get-WindowsBuildVersion
             if (!$Script:Config.Images) {
                 $Script:Config | Add-Configuration 'Images' ([PSCustomObject]@{
-                    NanoServer = "mcr.microsoft.com/windows/nanoserver:$WinVer"
-                    ServerCore = "mcr.microsoft.com/windows/servercore:$WinVer"
+                    NanoServer = "mcr.microsoft.com/windows/nanoserver:$Script:WinVer"
+                    ServerCore = "mcr.microsoft.com/windows/servercore:$Script:WinVer"
                 })
 
                 $Script:Config.Images | Add-Configuration 'Infrastructure' $(if ($Script:WinVer -notmatch '^10\.0\.17763') {
@@ -193,12 +192,12 @@ function ValidateKubernetesWindowsNodeConfiguration {
             }
 
             if (!$Script:Config.Images.NanoServer) {
-                $Script:Config.Images | Add-Configuration 'NanoServer' "mcr.microsoft.com/windows/nanoserver:$WinVer"
+                $Script:Config.Images | Add-Configuration 'NanoServer' "mcr.microsoft.com/windows/nanoserver:$Script:WinVer"
                 Write-Host "'Images.NanoServer' was not specified. Using '$($Script:Config.Images.NanoServer)'."
             }
 
             if (!$Script:Config.Images.ServerCore) {
-                $Script:Config.Images | Add-Configuration 'ServerCore' "mcr.microsoft.com/windows/servercore:$WinVer"
+                $Script:Config.Images | Add-Configuration 'ServerCore' "mcr.microsoft.com/windows/servercore:$Script:WinVer"
                 Write-Host "'Images.ServerCore' was not specified. Using '$($Script:Config.Images.ServerCore)'."
             }
 
@@ -253,6 +252,11 @@ function ValidateKubernetesWindowsNodeConfiguration {
 
             if (!$Script:Config.Kubernetes.Network.DnsServiceIPAddress) {
                 $Errors += 'Missing ''Kubernetes.Network.DnsServiceIPAddress''.'
+            }
+
+            if (!$Script:Config.Wins) {
+                $Script:Config | Add-Configuration 'Wins' ([PSCustomObject]@{ Version = 'latest' })
+                Write-Host '''Wins.Value'' was not specifified. Using version ''latest'' of Wins.'
             }
         }
     }
@@ -895,26 +899,6 @@ function Install-Dockerd {
     }
 }
 
-function Install-DockerHostNetworkCreator {
-    [CmdletBinding()]
-    [OutputType([System.ServiceProcess.SerivceController])]
-    Param (
-        $Path = $Script:KubernetesClusterNodeInstallationPath
-    )
-
-    Process {
-        Write-Host 'Installing ''Docker host Network Creation Service'' service...'
-
-        $DockerHostNetworkCreationSvc = Get-Service dockerhostnetworkcreator -ErrorAction SilentlyContinue
-        if (!$DockerHostNetworkCreationSvc) {
-            $DockerHostNetworkCreationCommandLine = @(
-                
-            )
-        }
-
-    }
-}
-
 function Install-Flanneld {
     [CmdletBinding()]
     [OutputType([System.ServiceProcess.ServiceController])]
@@ -1118,6 +1102,50 @@ function Install-KubeProxy {
     }
 }
 
+function Install-RancherWins {
+    [CmdletBinding()]
+    Param (
+        [string] $Path = $Script:WinsPath,
+        [string] $Version = 'latest',
+        [switch] $Force
+    )
+
+    Process {
+        $WinsSvc = Get-Service rancher-wins -ErrorAction SilentlyContinue
+        if (!$WinsSvc) {
+            $Version = switch -Regex ($Version) {
+                '(?i)^latest$' {
+                    (Invoke-RestMethod -Method GET -Uri 'https://api.github.com/repos/rancher/wins/releases/latest' -ErrorAction Stop).'tag_name'
+                }
+
+                '^v?\d+\.\d+\.\d+$' {
+                    $_.ToLower().TrimStart('v')
+                }
+
+                default {
+                    Write-Error "'$Version' is not a valid version specification."
+                }
+            }
+
+            DownloadFile -Url "https://github.com/rancher/wins/releases/download/$Version/wins.exe" -Destination (Join-Path $Path 'wins.exe') -Force:$Force -ErrorAction Stop
+        
+            if ($env:PATH -inotmatch 'C:\wins;') {
+                $env:PATH = "$env:PATH;C:\wins" -replace ';;'
+                [Environment]::SetEnvironmentVariable('PATH',$env:PATH,[EnvironmentVariableTarget]::Machine)
+            }
+
+            # Register wins as a service
+            wins.exe srv app run --register
+
+            $WinsSvc = Get-Service rancher-wins
+        }
+
+        if ($WinsSvc.Status -ne 'Running') {
+            $WinsSvc | Start-Service
+        }
+    }
+}
+
 # TODO: Add parameters for the working directory...maybe other stuff...this cmdlet has A LOT of assumptions baked into it.....
 function Join-KubernetesCluster {
     $Script:Config = Get-KubernetesWindowsNodeConfiguration
@@ -1139,6 +1167,9 @@ function Join-KubernetesCluster {
         $env:KUBE_NETWORK = $Script:Config.Cni.NetworkName.ToLower()
         [Environment]::SetEnvironmentVariable('KUBE_NETWORK', $env:KUBE_NETWORK, [EnvironmentVariableTarget]::Machine)
     }
+
+    Install-RancherWins -Path $Script:WinsPath -Version $Script:Config.Wins.Version
+    Write-Host "Rancher Wins has been installed as a Windows Service."
 
     $InstallKubeletParams = @{
         CniPath = $Script:CniPath
@@ -1518,7 +1549,9 @@ function New-KubernetesWindowsNodeConfiguration {
 
         [string] $PauseImage,
 
-        [string] $ServerCoreImage
+        [string] $ServerCoreImage,
+
+        [string] $WinsVersion = 'latest'
     )
 
     if (!$NanoServerImage) {
@@ -1597,6 +1630,9 @@ function New-KubernetesWindowsNodeConfiguration {
             IPAddress = Get-InterfaceIPAddress -InterfaceName $InterfaceName
             Subnet = Get-InterfaceSubnet -InterfaceName $InterfaceName
             DefaultGateway = Get-InterfaceDefaultGateway -InterfaceName $InterfaceName
+        }
+        Wins = [PSCustomObject]@{
+            Version = $WinsVersion.ToLower().TrimStart('v')
         }
     }
 
@@ -2981,6 +3017,8 @@ $(if ($Config.Images.Infrastructure.Build) {
 } else {
     "            Pause: $($Config.Images.Infrastructure.Pause)"
 })
+    Wins:
+        Version: $($Config.Wins.Version)
 
 ########################################################################################################################
 
@@ -2998,5 +3036,6 @@ $(if ($Config.Images.Infrastructure.Build) {
 [string] $Script:CniPath = Join-Path $Script:KubernetesClusterNodeInstallationPath 'cni'
 [string] $Script:CniConfigurationPath = Join-Path (Join-Path $Script:CniPath 'config') 'cni.conf'
 [string] $Script:NetworkConfigurationPath = Join-Path $Script:KubernetesClusterNodeInstallationPath 'net-conf.json'
+[string] $Script:WinsPath = Join-Path C: wins
 
 $ProgressPreference = 'SilentlyContinue'
