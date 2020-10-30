@@ -55,14 +55,14 @@ function DownloadFile {
 
         try {
             if (!$Destination) {
-                curl.exe -L $Url | ForEach-Object -Begin { $result = New-Object System.Text.StringBuilder } -Process { $result = $result.Append($_) } -End { $result.ToString() }
+                curl.exe -sL $Url | ForEach-Object -Begin { $result = New-Object System.Text.StringBuilder } -Process { $result = $result.Append($_) } -End { $result.ToString() }
             } else {
                 $Path = Split-Path $Destination -Parent
                 if (!(Test-Path $Path)) {
                     $null = New-Item -ItemType Directory -Path $Path
                 }
 
-                curl.exe -L $Url -o $Destination
+                curl.exe -sL $Url -o $Destination
                 Write-Host "Downloaded [$Url] => [$Destination]"
             }
         } catch {
@@ -467,28 +467,6 @@ function Get-DockerImage {
     }
 }
 
-function Get-FlanneldBinaries {
-    Param (
-        [Parameter(Position = 0, Mandatory)]
-        [string] $Version,
-        [string] $Destination = 'C:\flannel',
-        [switch] $Force
-    )
-
-    Process {
-        if ($Force -and $Force.IsPresent -and (Test_Path $Destination)) {
-            Remove-Item -Path $Destination -Recurse -Force
-        }
-
-        if (!(Test-Path $Destination)) {
-            $null = New-Item -ItemType Directory $Destination
-        }
-
-        DownloadFile -Url "https://github.com/coreos/flannel/releases/download/v$Version/flanneld.exe" -Destination (Join-Path $Destination 'flanneld.exe') -Force:$Force -ErrorAction Stop
-        Write-Host "Finished downloading Flanneld v$Version to '$Destination'"
-    }
-}
-
 function Get-GolangVersionMetadata {
     [CmdletBinding()]
     [OutputType('GoLang.VersionMetadata')]
@@ -675,66 +653,6 @@ function Get-KubernetesWindowsNodeConfiguration {
     $NodeConfig
 }
 
-function Get-SourceVip {
-    Param (
-        [Parameter(Position = 0)]
-        [string] $Path = $Script:KubernetesClusterNodeInstallationPath,
-
-        [Parameter(Position = 1)]
-        [string] $CniPath = $Script:CniPath,
-
-        [Parameter(Position = 2)]
-        [string] $NetworkName = 'vxlan0'
-    )
-
-    $SourceVipPath = Join-Path $Path 'sourceVip.json'
-    $SourceVipReqeuestPath = Join-Path $Path 'sourceVipRequest.json'
-
-    $HnsNetwork = Get-HnsNetwork | Where-Object { $_.Name -eq $NetworkName.ToLower() }
-    $HnsNetworkSubnet = $HnsNetwork.Subnets[0].AddressPrefix
-
-    $IpamConfig = @"
-{
-    "cniVersion": "0.2.0",
-    "name": "vxlan0",
-    "ipam": {
-        "type": "host-local",
-        "ranges": [
-            [
-                {
-                    "subnet": "$HnsNetworkSubnet"
-                }
-            ]
-        ],
-        "dataDir": "/var/lib/cni/networks"
-    }
-}
-"@
-
-    $IpamConfig | Out-File $SourceVipRequestPath
-
-    $CurrentLocation = $PWD
-    $env:CNI_COMMAND = 'ADD'
-    $env:CNI_CONTAINERID= 'dummy'
-    $env:CNI_NETNS='dummy'
-    $env:CNI_IFNAME = 'dummy'
-    $env:CNI_PATH = $CniPath
-
-    Set-Location $env:CNI_PATH
-    Get-Content $SourceVipRequest | .\host-local.exe | Out-File $SourceVipPath
-    $SourceVip = Get-Content $SourceVipJson | ConvertFrom-JSON
-
-    Remove-Item env:\CNI_COMMAND
-    Remove-Item env:\CNI_CONTAINERD
-    Remove-Item env:\CNI_NETNS
-    Remove-Item env:\CNI_IFNAME
-    Remove-Item env:\CNI_PATH
-
-    Set-Location $CurrentLocation
-
-    ($SourceVip.ip4.ip -split '/')[0]
-}
-
 function Get-SubnetMaskLength {
     Param (
         [Parameter(Position = 0, Mandatory, ValueFromPipeline)]
@@ -756,68 +674,6 @@ function Get-WindowsBuildVersion {
     Param()
 
     (& cmd /c ver)[1] -replace '.*\[Version (.*)\]','$1'
-}
-
-function Install-ContainerNetworkInterface {
-    [CmdletBinding()]
-    [OutputType([System.ServiceProcess.ServiceController])]
-    Param (
-        [string] $InterfaceName = 'Ethernet',
-
-        [string] $NetworkConfigurationPath = $Script:NetworkConfigurationPath,
-
-        [ValidateSet('flannel','kubenet')]
-        [string] $CniPluginName = 'flannel',
-
-        [string] $CniPluginVersion = '0.13.0',
-
-        [string] $CniPluginInstallationPath = 'C:\flannel',
-
-        [ValidateSet('overlay','l2bridge')]
-        [string] $NetworkMode = 'overlay',
-
-        [string] $NetworkName = 'vxlan0',
-
-        [string] $ClusterCIDR = '10.244.0.0/16',
-
-        [string] $KubeConfig = $env:KUBECONFIG
-    )
-
-    Process {
-        $NetworkMode = $NetworkMode.ToLower()
-        $NetworkName = $NetworkName.ToLower()
-
-        switch ($CniPluginName) {
-            'kubenet' {
-                Write-Error "'$CniPluginName' is not yet supported."
-                return
-            }
-
-            'flannel' {
-                if (!(Get-Service Flanneld -ErrorAction SilentlyContinue)) {
-                    # Need to stop the Kubelet service so that we can update the CNI and kubernetes node network configuration
-                    Stop-Service Kubelet -WarningAction SilentlyContinue -ErrorAction Stop
-
-                    Set-NetConfig -Path $NetworkConfigurationPath -NetworkMode $NetworkMode -NetworkName $NetworkName -ClusterCIDR $ClusterCIDR -ErrorAction Stop
-                                
-                    New-KubernetesNetwork -InterfaceName $InterfaceName -NetworkMode $NetworkMode -ErrorAction Stop
-
-                    $FlannelDInterfaceName = $(
-                        $NetworkAdatpter = Get-NetAdapter -InterfaceAlias "vEthernet ($InterfaceName)" -ErrorAction SilentlyContinue
-                        if ($NetworkAdapter) {
-                            $NetworkAdapter.InterfaceAlias
-                        } else {
-                            $Script:Config.Node.InterfaceName
-                        }
-                    )
-
-                    Install-Flanneld -Path $CniPluginInstallationPath -NetworkConfigurationPath $NetworkConfigurationPath -Version $CniPluginVersion -InterfaceName (Get-NetAdapter -InterfaceAlias "vEthernet ($InterfaceName)" -ErrorAction SilentlyContinue).InterfaceAlias -KubeConfig $KubeConfig -ErrorAction Stop
-
-                    break
-                }
-            }
-        }
-    }
 }
 
 function Install-ContainerRuntimeInterface {
@@ -905,76 +761,14 @@ function Install-Dockerd {
     }
 }
 
-function Install-Flanneld {
-    [CmdletBinding()]
-    [OutputType([System.ServiceProcess.ServiceController])]
-    Param (
-        [string] $Path = 'C:\flannel',
-
-        [string] $NetworkConfigurationPath = $Script:NetworkConfigurationPath,
-
-        [string] $LogPath = (Join-Path $Script:KubernetesClusterNodeLogPath 'flanneld'),
-
-        [string] $Version = '0.13.0',
-
-        [string] $InterfaceName = 'vEthernet (Ethernet)',
-
-        [string] $KubeConfig = $env:KUBECONFIG
-    )
-
-    Process {
-        Write-Host "Installing FlannelD to '$Path'..."
-
-        if (!(Test-Path $LogPath)) {
-            $null = New-Item -ItemType Directory -Path $LogPath
-        }
-
-        Get-FlanneldBinaries -Destination $Path -Version $Version
-
-        $FlanneldSvc = Get-Service Flanneld -ErrorAction SilentlyContinue
-        if (!$FlanneldSvc) {
-            $FlanneldCommandLine = @(
-                $(Join-Path $Path 'flanneld.exe')
-                "--kubeconfig-file=`"$KubeConfig`""
-                "--net-config-path=`"$NetworkConfigurationPath`""
-                "--iface=`"$InterfaceName`""
-                "--ip-masq=1"
-                "--kube-subnet-mgr=1"
-            )
-
-            $null = New-ServiceEx -Name 'Flanneld' -CommandLine $FlanneldCommandLine -DependsOn 'kubelet' -LogFilePath (Join-Path $LogPath 'flanneldsvc.log') -EnvironmentVariable @{ 'NODE_NAME' = $env:COMPUTERNAME.ToLower() }
-        }
-
-        # The newly created service is disposed, so just query for the object again.
-        Get-Service -Name 'Flanneld'
-    }
-}
-
 function Install-Kubelet {
     [CmdletBinding()]
     [OutputType([System.ServiceProcess.ServiceController])]
     Param (
         [string] $CniConfigurationPath = $Script:CniConfigurationPath,
         [string] $CniPath = $Script:CniPath,
-        [ValidateSet('flannel','kubenet')]
-        [string] $CniPluginName = 'flannel',
-
-        [ValidateSet('containerd','dockerd')]
-        [string] $CriName = 'dockerd',
-
-        [ValidateSet('overlay','l2bridge')]
-        [string] $NetworkMode = 'overlay',
-
-        [string] $NetworkName = 'vxlan0',
-
-        [string] $NodeIpAddress = (Get-InterfaceIpAddress),
-        [string] $NodeSubnet = (Get-InterfaceSubnet),
 
         [string] $KubeConfig = $env:KUBECONFIG,
-
-        [string] $ClusterCIDR = '10.244.0.0/16',
-
-        [string] $ServiceCIDR = '10.96.0.0/12',
 
         [string] $DnsServiceIpAddress = '10.96.0.10',
         
@@ -988,8 +782,6 @@ function Install-Kubelet {
 
         $KubeletSvc = Get-Service 'kubelet' -ErrorAction SilentlyContinue
         if (!$KubeletSvc) {
-            Set-CniConfiguration -Path $CniConfigurationPath -NodeIpAddress $NodeIpAddress -NodeSubnet $NodeSubnet -PluginName $CniPluginName -NetworkMode $NetworkMode -NetworkName $NetworkName -ClusterCIDR $ClusterCIDR -ServiceCIDR $ServiceCIDR -ErrorAction Stop
-
             $KubeletArgs = @(
                 (Get-Command 'kubelet.exe' -ErrorAction Stop).Source
                 '--windows-service'
@@ -1024,91 +816,6 @@ function Install-Kubelet {
         }
 
         $KubeletSvc
-    }
-}
-
-function Install-KubeProxy {
-    [CmdletBinding()]
-    [OutputType([System.ServiceProcess.ServiceController])]
-    Param (
-        [string] $KubeProxyConfigPath = $(Join-Path $Script:KubernetesClusterNodeInstallationPath 'kube-proxy.conf'),
-
-        [string] $KubeProxyLogPath = $(Join-Path $Script:KubernetesClusterNodeLogPath 'kube-proxy'),
-
-        [string] $KubeConfig = $env:KUBECONFIG,
-
-        [string] $NetworkName = 'vxlan0',
-
-        [object] $SourceVip,
-
-        [string] $ClusterCIDR = '10.244.0.0/16',
-
-        [string[]] $FeatureGates
-    )
-
-    Process {
-        $KubeProxySvc = Get-Service 'kube-proxy' -ErrorAction SilentlyContinue
-        if (!$KubeProxySvc) {
-            $NetworkName = $NetworkName.ToLower()
-
-            if (!(Test-Path (Split-Path $KubeProxyConfigPath -Parent))) {
-                $null = New-Item -ItemType Directory -Path (Split-Path $KubeProxyConfigPath -Parent)
-            }
-
-            if (!(Test-Path $KubeProxyLogPath)) {
-                $null = New-Item -ItemType Directory -Path $KubeProxyLogPath
-            }
-
-            $KubeProxyConfiguration = @{
-                Kind = 'KubeProxyConfiguration'
-                apiVersion = 'kubeproxy.config.k8s.io/v1alpha1'
-                hostnameOverride = $env:COMPUTERNAME.ToLower()
-                clusterCIDR = $ClusterCIDR
-                clientConnection = @{
-                    kubeconfig = $KubeConfig
-                }
-                winkernel = @{
-                    enableDsr = 'WinDSR=true' -iin $FeatureGates
-                    networkName = $NetworkName
-                }
-            }
-
-            Write-Host "Installing Kubeproxy as a service..."
-        
-            $KubeProxyArgs = @(
-                (Get-Command kube-proxy.exe -ErrorAction Stop).Source
-                "--hostname-override=$($env:COMPUTERNAME.ToLower())"
-                '--v=6'
-                '--proxy-mode=kernelspace'
-                "--kubeconfig=`"$KubeConfig`""
-                "--network-name=$NetworkName"
-                "--cluster-cidr=$ClusterCIDR"
-                "--log-dir=`"$KubeProxyLogPath`""
-                '--logtostderr=false'
-                '--windows-service'
-            )
-
-            if ('WinDSR=true' -iin $FeatureGates) {
-                $KubeProxyArgs += '--enable-dsr=true'
-            }
-
-            if ($SourceVip) {
-                $KubeProxyArgs += "--source-vip=$(ConvertFrom-JSON $SourceVip -Compress)"
-                $KubeProxyConfiguration.winkernel += @{
-                    sourceVip = $SourceVip;
-                }
-            }
-
-            if ($FeatureGates) {
-                $KubeProxyArgs += "--feature-gates=$($FeatureGates -join ',')"
-            }
-
-            ConvertTo-JSON -Depth 100 $KubeProxyConfiguration | Set-Content $KubeProxyConfigPath
-
-            $KubeProxySvc = New-Service -Name 'kube-proxy' -StartupType Automatic -DisplayName 'Kube-Proxy' -Description 'Kube-Proxy Kubernetes Service' -BinaryPathName "$KubeProxyArgs"
-        }
-
-        $KubeProxySvc
     }
 }
 
@@ -1177,57 +884,23 @@ function Join-KubernetesCluster {
         [Environment]::SetEnvironmentVariable('KUBE_NETWORK', $env:KUBE_NETWORK, [EnvironmentVariableTarget]::Machine)
     }
 
+    $null = Install-RancherWins -Path $Script:WinsPath -Version $Script:Config.Wins.Version -ErrorAction Stop
+    Write-Host "Rancher Wins has been installed as a Windows Service."
+    Write-Host 'Starting Rancher Wins...'
+    Start-Service rancher-wins
+
     $InstallKubeletParams = @{
         CniPath = $Script:CniPath
         CniConfigurationPath = $Script:CniConfigurationPath
-        CniPluginName = $Script:Config.Cni.Plugin.Name
-        CriName = $Script:Config.Cri.Name
-        NetworkMode = $Script:Config.Cni.NetworkMode
-        NetworkName = $Script:Config.Cni.NetworkName
-        NodeIpAddress = $Script:Config.Node.IPAddress
-        NodeSubnet = $Script:Config.Node.Subnet
         KubeConfig = $env:KUBECONFIG
-        ClusterCIDR = $Script:Config.Kubernetes.Network.ClusterCIDR
-        ServiceCIDR = $Script:Config.Kubernetes.Network.ServiceCIDR
         DnsServiceIpAddress = $Script:Config.Kubernetes.Network.DnsServiceIpAddress
         FeatureGates = $Script:Config.Kubernetes.Kubelet.FeatureGates
     }
     $null = Install-Kubelet -ErrorAction Stop @InstallKubeletParams
     Write-Host "Installed Kubelet as a Windows Service"
-    
-    <#
-    $InstallCNIParams = @{
-        InterfaceName = $(
-            $NetworkAdatpter = Get-NetAdapter -InterfaceAlias "vEthernet ($($Script:Config.Node.InterfaceName))" -ErrorAction SilentlyContinue
-            if ($NetworkAdapter) {
-                $NetworkAdapter.InterfaceAlias
-            } else {
-                $Script:Config.Node.InterfaceName
-            }
-        )
-        NetworkConfigurationPath = $Script:NetworkConfigurationPath
-        CniPluginName = $Script:Config.Cni.Plugin.Name
-        CniPluginVersion = $Script:Config.Cni.Plugin.Version
-        NetworkMode = $Script:Config.Cni.NetworkMode
-        NetworkName = $Script:Config.Cni.NetworkName
-        ClusterCIDR = $Script:Config.Kubernetes.Network.ClusterCIDR
-        KubeConfig = $env:KUBECONFIG
-    }
-    $null = Install-ContainerNetworkInterface -ErrorAction Stop @InstallCNIParams
-    Write-Host "Finished installing the Container Network Interface (CNI)."
-    #>
-
-    $null = Install-RancherWins -Path $Script:WinsPath -Version $Script:Config.Wins.Version
-    Write-Host "Rancher Wins has been installed as a Windows Service."
-
-    # IMPORTANT: Ordering is important, Kubelet, THEN FlannelD, THEN rancher-wins.
     Write-Host 'Starting Kubelet...'
     Start-Service Kubelet
-    #Write-Host 'Starting FlannelD...'
-    #Start-Service FlannelD
-    #WaitForNetwork $Script:Config.Cni.NetworkName
-    Write-Host 'Starting Rancher Wins...'
-    Start-Service rancher-wins
+    
     WaitForNetwork 'flannel.4096'
 
     kubeadm.exe join "$(Get-ApiServerEndpoint)" --token $Script:Config.Kubernetes.ControlPlane.JoinToken --discovery-token-ca-cert-hash "$($Script:Config.Kubernetes.ControlPlane.CAHash)"
@@ -1235,19 +908,6 @@ function Join-KubernetesCluster {
         Write-Error "Error joining cluster!"
         return
     }
-
-    $KubeProxyInstallParams = @{
-        KubeProxyConfigPath = Join-Path $Script:KubernetesClusterNodeInstallationPath 'kube-proxy.conf'
-        NetworkName = $Script:Config.Cni.NetworkName
-        ClusterCIDR = $Script:Config.Kubernetes.Network.ClusterCIDR
-        FeatureGates = $Script:Config.Kubernetes.KubeProxy.FeatureGates
-    }
-    if ($Script:Config.Cni.NetworkMode -ieq 'overlay') {
-        $KubeProxyInstallParams += @{ SourceVip = (Get-SourceVip -NetworkName $Script:Config.Cni.NetworkName) }
-    }
-    Install-KubeProxy -ErrorAction Stop @KubeProxyInstallParams
-    Start-Service 'kube-proxy'
-    Write-Host "Installed Kube-Proxy as a Windows Service"
 
     if (!(Test-NodeRunning)) {
         throw "Kubelet is not running and/or failed to bootstrap."
@@ -1476,30 +1136,6 @@ Write-Host ('Downloading yq v{0}...' -f $env:yqVersion); \
     }
 }
 
-function New-KubernetesNetwork {
-    Param (
-        [string] $InterfaceName = 'Ethernet',
-
-        [ValidateSet('overlay','l2bridge')]
-        [string] $NetworkMode = 'overlay'
-    )
-
-    $NetworkMode = $NetworkMode.ToLower()
-
-    $HnsNetwork = Get-HnsNetwork | Where-Object { $_.Name -eq 'External' }
-
-    if ($NetworkMode -eq 'l2bridge') {
-        if (!$HnsNetwork) {
-            New-HnsNetwork -Type $NetworkMode -AddressPrefix '192.168.255.0/30' -Gateway '192.168.255.1' -Name 'External' -AdapterName $InterfaceName
-        }
-    } else {
-        New-NetFirewallRule -Name 'OverlayTraffic4789UDP' -Description 'Overlay network traffic (UDP)' -Action Allow -LocalPort 4789 -Enabled True -DisplayName 'Overlay Traffic 4789 UDP (Inbound)' -Protocol UDP -ErrorAction SilentlyContinue
-        if (!$HnsNetwork) {
-            New-HnsNetwork -Type $NetworkMode -AddressPrefix '192.168.255.0/30' -Gateway '192.168.255.1' -Name 'External' -AdapterName $InterfaceName -SubnetPolicies @(@{ Type = 'VSID'; VSID = 9999 })
-        }
-    }
-}
-
 function New-KubernetesPauseContainerImage {
     Param (
         [string] $Dockerfile,
@@ -1660,229 +1296,6 @@ function New-KubernetesWindowsNodeConfiguration {
     $Script:Config
 }
 
-function New-ServiceEx {
-    [OutputType([System.ServiceProcess.ServiceController])]
-    Param (
-        [Parameter(Position = 0, Mandatory)]
-        [string] $Name,
-
-        [Parameter(Position = 1, Mandatory)]
-        [string[]] $CommandLine,
-
-        [string[]] $DependsOn,
-
-        [Parameter(Mandatory)]
-        [string] $LogFilePath,
-
-        [hashtable] $EnvironmentVariable
-    )
-
-    Process {
-        $WrappedServiceExe = New-ServiceWrapper -Name $Name -CommandLine $CommandLine -LogFile $LogFilePath -EnvironmentVariable $EnvironmentVariable
-
-        $Service = New-Service -Name $Name -BinaryPathName $WrappedServiceExe -DependsOn $DependsOn -DisplayName $Name -StartupType Automatic -Description "$Name Kubernetes Service"
-
-        Write-Host @"
-
-++++++++++++++++++++++++++++++++
-Successfully created the service
-++++++++++++++++++++++++++++++++
-Service     : [$Name]
-Command Line: [$CommandLine]
-Environment : [$($EnvironmentVariable | ConvertTo-JSON)]
-Log File    : [$LogFilePath]
-Deponds On  : [$($DependsOn -join ', ')]
-+++++++++++++++++++++++++++++++++
-
-"@
-
-        $Service
-    }
-}
-
-function New-ServiceWrapper {
-    Param (
-        [Parameter(Position = 0, Mandatory)]
-        [string] $Name,
-
-        [Parameter(Position = 1, Mandatory)]
-        [string[]] $CommandLine,
-
-        [Parameter(Position = 2, Mandatory)]
-        [string] $LogFile,
-
-        [Hashtable] $EnvironmentVariable
-    )
-
-    $ServiceExe = $CommandLine[0] -replace '\\', '\\' # Replace a single '\' with '\\'
-    $ServiceArgs = $CommandLine | Select-Object -Skip 1 | ForEach-Object { $_ -replace '\\', '\\' -replace '"', '\"' }
-    $WrappedServiceExe = Join-Path (Split-Path $CommandLine[0] -Parent) "${Name}Svc.exe"
-    $LogFile = $LogFile -replace '\\', '\\'
-
-    Write-Host "Creating a wrapper SCM service binary for [$Name] [$CommandLine] => [$WrappedServiceExe]..."
-    $ServiceSrc = @"
-using System;
-using System.ComponentModel;
-using System.IO;
-using System.ServiceProcess;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-
-public enum ServiceType {
-    SERVICE_WIN32_OWN_PROCESS   = 0x00000010,
-    SERVICE_WIN32_SHARE_PROCESS = 0x00000020
-}
-
-public enum ServiceState {
-    SERVICE_STOPPED          = 0x00000001,
-    SERVICE_START_PENDING    = 0x00000002,
-    SERVICE_STOP_PENDING     = 0x00000003,
-    SERVICE_RUNNING          = 0x00000004,
-    SERVICE_CONTINUE_PENDING = 0x00000005,
-    SERVICE_PAUSE_PENDING    = 0x00000006,
-    SERVICE_PAUSED           = 0x00000007
-}
-
-[StructLayout(LayoutKind.Sequential)]
-public struct ServiceStatus {
-    public ServiceType dwServiceType;
-    public ServiceState dwCurrentState;
-    public int dwControlsAccepted;
-    public int dwWin32ExitCode;
-    public int dwServiceSpecificExitCode;
-    public int dwCheckPoint;
-    public int dwWaitHint;
-};
-
-public class ${Name}ScmService : ServiceBase {
-    private ServiceStatus m_serviceStatus;
-    private Process m_process;
-    private StreamWriter m_writer = null;
-    private EventLog m_eventLog;
-
-    public ${Name}ScmService() {
-        ServiceName = "${Name}";
-        CanStop = true;
-        CanPauseAndContinue = false;
-
-        m_eventLog = new EventLog();
-        if (!EventLog.SourceExists(ServiceName)) {
-            EventLog.CreateEventSource(ServiceName, "System");
-        }
-        m_eventLog.Source = ServiceName;
-        m_eventLog.Log = "System";
-
-        m_writer = new StreamWriter("$LogFile");
-        Console.SetOut(m_writer);
-        Console.WriteLine("$ServiceExe ${Name}ScmService()");
-    }
-
-    ~${Name}ScmService() {
-        if (m_writer != null) m_writer.Dispose();
-    }
-
-    [DllImport("advapi32.dll", SetLastError=true)]
-    private static extern bool SetServiceStatus(IntPtr hService, ref ServiceStatus status);
-
-    protected override void OnStart(string[] args) {
-        m_eventLog.WriteEntry(string.Format("{0} is starting.", ServiceName));
-        m_serviceStatus = new ServiceStatus();
-        m_serviceStatus.dwServiceType = ServiceType.SERVICE_WIN32_OWN_PROCESS;
-        m_serviceStatus.dwCurrentState = ServiceState.SERVICE_START_PENDING;
-        m_serviceStatus.dwWin32ExitCode = 0;
-        m_serviceStatus.dwWaitHint = 2000;
-        SetServiceStatus(this.ServiceHandle, ref m_serviceStatus);
-
-        try {
-            m_process = new Process();
-            
-            var startInfo = m_process.StartInfo;
-            startInfo.UseShellExecute = false;
-            startInfo.RedirectStandardOutput = true;
-            startInfo.RedirectStandardError = true;
-            startInfo.FileName = "$ServiceExe";
-            startInfo.Arguments = "$ServiceArgs";
-            $(if ($EnvironmentVariable) {
-                $EnvironmentVariable.Keys |
-                    ForEach-Object -Begin { $envSrc = '' } -Process {
-                        $envSrc += @"
-            startInfo.EnvironmentVariables["$_"] = "$($EnvironmentVariable[$_])";
-"@
-                    } -End {
-                        $envSrc
-                    }
-                }
-            )
-
-            m_process.EnableRaisingEvents = true;
-            m_process.OutputDataReceived += new DataReceivedEventHandler((s, e) => Console.WriteLine(e.Data));
-            m_process.ErrorDataReceived += new DataReceivedEventHandler((s, e) => Console.WriteLine(e.Data));
-
-            m_process.Exited += new EventHandler((s, e) => {
-                Console.WriteLine("$ServiceExe exited unexpectedly ({0})",  m_process.ExitCode);
-                if (m_writer != null) m_writer.Flush();
-                m_serviceStatus.dwCurrentState = ServiceState.SERVICE_STOPPED;
-                SetServiceStatus(this.ServiceHandle, ref m_serviceStatus);
-            });
-
-            m_process.Start();
-            m_process.BeginOutputReadLine();
-            m_process.BeginErrorReadLine();
-            m_serviceStatus.dwCurrentState = ServiceState.SERVICE_RUNNING;
-            Console.WriteLine("OnStart - Successfully started the service.");
-            m_eventLog.WriteEntry(string.Format("{0} successfully started.", ServiceName));
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine("OnStart - failed to start the service : {0}", e.Message);
-            m_eventLog.WriteEntry(string.Format("{0} failed to start.\r\n{1}\r\n{2}", ServiceName, e.Message, e.Data), EventLogEntryType.Error);
-            m_serviceStatus.dwCurrentState = ServiceState.SERVICE_STOPPED;
-        }
-        finally {
-            SetServiceStatus(this.ServiceHandle, ref m_serviceStatus);
-            if (m_writer != null) m_writer.Flush();
-        }
-    }
-
-    protected override void OnStop() {
-        Console.WriteLine("OnStop {0}", ServiceName);
-        m_eventLog.WriteEntry(string.Format("{0} is stopping.", ServiceName));
-        try {
-            m_serviceStatus.dwCurrentState = ServiceState.SERVICE_STOPPED;
-            if (m_process != null)
-            {
-                m_process.Kill();
-                m_process.WaitForExit();
-                m_process.Close();
-                m_process.Dispose();
-                m_process = null;
-            }
-            Console.WriteLine("OnStop - Sucessfully stopped the service {0}", ServiceName);
-            m_eventLog.WriteEntry(string.Format("{0} was successfully stopped.", ServiceName));
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(string.Format("OnStop - Failed to stop the {0} service: {1}", ServiceName, e.Message));
-            m_eventLog.WriteEntry(string.Format("{0} failed to stop.\r\n{1}\r\n{2}", ServiceName, e.Message, e.Data), EventLogEntryType.Error);
-            m_serviceStatus.dwCurrentState = ServiceState.SERVICE_RUNNING;
-        }
-        finally {
-            SetServiceStatus(this.ServiceHandle, ref m_serviceStatus);
-            if (m_writer != null) m_writer.Flush();
-        }
-    }
-
-    public static void Main() {
-        System.ServiceProcess.ServiceBase.Run(new ${Name}ScmService());
-    }
-}
-"@
-
-    Add-Type -TypeDefinition $ServiceSrc -Language CSharp -OutputAssembly $WrappedServiceExe -OutputType ConsoleApplication -ReferencedAssemblies 'System.ServiceProcess' -ErrorAction Stop
-
-    $WrappedServiceExe
-}
-
 <#
 .SYNOPSIS
 
@@ -1919,7 +1332,7 @@ function New-SshKey {
 function New-WindowsKubernetesClusterNode {
     [CmdletBinding()]
     Param (
-        [string] $ConfigurationFile = $Script:KubernetesClusterNodeConfigurationPath,
+        [string] $ConfigurationFile,
         [string] $WorkspacePath = 'c:\k',
         [switch] $Force
     )
@@ -1945,7 +1358,7 @@ function New-WindowsKubernetesClusterNode {
         if ($ConfigurationFile -and (Test-Path $ConfigurationFile)) {
             $Script:Config = Get-KubernetesWindowsNodeConfiguration -Path $ConfigurationFile -ErrorAction Stop
             ValidateKubernetesWindowsNodeConfiguration -ErrorAction Stop
-            if (!(Set-KubernetesWindowsNodeConfiguration $Script:KubernetesClusterNodeConfigurationPath -Force:$Force)) {
+            if ($ConfigurationFile -ine $Script:KuberenetesClusterNodeConfigurationPath -and !(Set-KubernetesWindowsNodeConfiguration $Script:KubernetesClusterNodeConfigurationPath -Force:$Force)) {
                 $resp = Read-HostEx "Do you want to read the existing configuration file? [Y/n] (Default 'Y') " -ExpectedValue 'Y','n'
                 if (!$resp -or $resp -ieq 'y') {
                     $Script:Config = Get-KubernetesWindowsNodeConfiguration
@@ -1955,7 +1368,7 @@ function New-WindowsKubernetesClusterNode {
         }
         
         if (!$Script:Config) {
-            $Script:Config = Get-KubernetesWindowsNodeConfiguration
+            $Script:Config = Get-KubernetesWindowsNodeConfiguration -ErrorAction Stop
             ValidateKubernetesWindowsNodeConfiguration -ErrorAction Stop
         }
     
@@ -2598,24 +2011,6 @@ function Remove-KubernetesBinaries {
     Remove-Item $Path -Recurse -Force -ErrorACtion SilentlyContinue
 }
 
-function Remove-KubernetesNetwork {
-    Param (
-        [Parameter(Position = 0, ValueFromPipeline)]
-        [string] $NetworkName = 'vxlan0'
-    )
-
-    Process {
-        $HnsNetwork = Get-HnsNetwork | Where-Object { $_.Name -eq $NetworkName.ToLower() }
-
-        if ($HnsNetwork)
-        {
-            Write-Host "Removing existing HNS network:"
-            Write-Host ($HnsNetwork | ConvertTo-Json -Depth 10) 
-            Remove-HnsNetwork $HnsNetwork
-        }
-    }
-}
-
 function Remove-WindowsKubernetesClusterNode {
     Param (
         [Parameter(Position = 0)]
@@ -2636,191 +2031,16 @@ function Remove-WindowsKubernetesClusterNode {
         Remove-Containers
     }
 
-    Uninstall-ContainerNetworkInterface -PluginName $Script:Config.Cni.Plugin.Name
-    Uninstall-KubeProxy
-    Uninstall-Kubelet
+    Uninstall-KubeletService
+    Uninstall-RancherWinsService
     Remove-KubernetesBinaries -Path $KubernetesClusterNodeInstallationPath
-    Remove-KubernetesNetwork -NetworkName $Script:Config.Cni.NetworkName
+    Get-HnsNetwork | ? name -In 'vxlan0','flannel.4096' | Remove-HnsNetwork
 
+    cmd /c rmdir /s /q c:\var  # <-- Remove-Item has a bug in PowerShell 5.1 where by -Recurse and -Force cause an error with symlinks
     Remove-Item $KubernetesClusterNodeInstallationPath -Recurse -ErrorAction SilentlyContinue -Force:$Force
     Remove-Item $env:USERPROFILE\.kube -Recurse -ErrorAction SilentlyContinue -Force:$Force
-}
-
-function Set-CniConfiguration {
-    Param (
-        [string] $Path = $Script:CniConfigurationPath,
-
-        [string] $CriName = 'dockerd',
-
-        [string] $NodeIpAddress = (Get-InterfaceIpAddress),
-
-        [string] $NodeSubnet = (Get-InterfaceSubnet),
-
-        [ValidateSet('flannel','kubenet')]
-        [string] $PluginName = 'flannel',
-
-        [ValidateSet('overlay','l2bridge')]
-        [string] $NetworkMode = 'overlay',
-
-        [string] $NetworkName = 'vxlan0',
-
-        [string] $ClusterCIDR = '10.244.0.0/16',
-
-        [string] $ServiceCIDR = '10.96.0.0/12'
-    )
-
-    Process {
-        $NetworkMode = $NetworkMode.ToLower()
-        $NetworkName = $NetworkName.ToLower()
-
-        if ($NetworkMode -ieq 'l2bridge') {
-            $CniConfig = ConvertFrom-JSON '{
-    "cniVersion": "0.3.0",
-    "name": "<NetworkName>",
-    "type": "flannel",
-    "capabilities": {
-        "dns": true
-    },
-    "delegate": {
-        "type": "win-bridge",
-        "policies": [
-            {
-                "Name": "EndpointPolicy",
-                "Value": {
-                    "Type": "OutBoundNAT",
-                    "ExceptionList": [
-                        "<ClusterCIDR>",
-                        "<ServiceCIDR>",
-                        "<MgmtSubnet>"
-                    ]
-                }
-            },
-            {
-                "Name": "EndpointPolicy",
-                "Value": {
-                    "Type": "ROUTE",
-                    "DestinationPrefix": "<ServerCIDR>",
-                    "NeedEncap": true
-                }
-            },
-            {
-                "Name": "EndpointPolicy",
-                "Value": {
-                    "Type": "ROUTE",
-                    "DestinationPrefix": "<MgmtSubnet>",
-                    "NeedEncap": true
-                }
-            }
-        ]
-    }
-}
-'
-            $CniConfig.name = $NetworkName
-            $CniConfig.type = $PluginName
-            $OutboundNatExceptions = $CniConfig.delegate.policies[0].Value.ExceptionList
-            $OutboundNatExceptions[0] = $ClusterCIDR
-            $OutboundNatExceptions[1] = $ServiceCIDR
-            $OutboundNatExceptions[2] = $NodeSubnet
-
-            if ($CriName -ieq 'dockerd') {
-                $CniConfig.delegate.policies[1].Value.DestinationPrefix = $ServiceCIDR
-                $CniConfig.delegate.policies[2].Value.DestinationPrefix = "${NodeIPAddress}/32"
-            } else {
-                $CniConfig.capabilities = $CniConfig.capabilities | Add-Member -MemberType NoteProperty -Name 'portMappings' -Value $true -PassThru
-                $CniConfig.delegate.type = 'sdnbridge'
-
-                $PolicyValue = $CniConfig.delegate.policies[0].Value
-                $Exceptions = $PolicyValue.ExceptionList
-                $PolicyValue.PSObject.Properties.Remove('ExceptionList')
-                $PolicyValue = $PolicyValue | Add-Member -MemberType NoteProperty -Name 'Settings' -Value @{ Exceptions = $Exceptions }
-                
-                $PolicyValue = $CniConfig.delegate.policies[1].Value
-                $PolicyValue.Type = 'SDNROUTE'
-                'DestinationPrefix','NeedEncap' | ForEach-Object { $PolicyValue.PSObject.Properties.Remove($_) }
-                $PolicyValue = $PolicyValue | Add-Member -MemberType NoteProperty -Name 'Settings' -Value @{ DestinationPrefix = $ServiceCIDR; NeedEncap = $True } -PassThru
-
-                $PolicyValue = $CniConfig.delegate.policies[2].Value
-                $PolicyValue.Type = 'SDNROUTE'
-                'DestinationPrefix','NeedEncap' | ForEach-Object { $PolicyValue.PSObject.Properties.Remove($_) }
-                $PolicyValue = $PolicyValue | Add-Member -MemberType NoteProperty -Name 'Settings' -Value @{ DestinationPrefix = "${NodeIPAddress}/32"; NeedEncap = $True } -PassThru
-
-                $Policies = $CniConfig.delegate.policies
-                $CniConfig.delegate.PSObject.Properties.Remove('policies')
-                $CniConfig.delegate = $CniConfig.delegate | Add-Member -MembxerType NoteProperty -Name 'AdditionalArgs' -Value $Policies -PassThru
-            }
-        } else {
-            $CniConfig = ConvertFrom-JSON '{
-    "cniVersion": "0.3.0",
-    "name": "<NetworkName>",
-    "type": "flannel",
-    "capabilities": {
-        "dns": true
-    },
-    "delegate": {
-        "type": "win-overlay",
-        "policies": [
-            {
-                "Name": "EndpointPolicy",
-                "Value": {
-                    "Type": "OutBoundNAT",
-                    "ExceptionList": [
-                        "<ClusterCIDR>",
-                        "<ServiceCIDR>"
-                    ]
-                }
-            },
-            {
-                "Name": "EndpointPolicy",
-                "Value": {
-                    "Type": "ROUTE",
-                    "DestinationPrefix": "<ServiceCIDR>",
-                    "NeedEncap": true
-                }
-            }
-        ]
-    }
-}
-'
-            $CniConfig.name = $NetworkName
-        
-            $OutboundNatExceptions = $CniConfig.delegate.policies[0].Value.ExceptionList
-            $OutboundNatExceptions[0] = $ClusterCIDR
-            $OutboundNatExceptions[1] = $ServiceCIDR
-
-            if ($CriName -ieq 'dockerd') {
-                $CniConfig.delegate.policies[1].Value.DestinationPrefix = $ServiceCIDR
-            } else {
-                Write-Error "SHOULDN'T BE HERE!!!"
-                $CniConfig.capabilities = $CniConfig.capabilities | Add-Member -MemberType NoteProperty -Name 'portMappings' -Value $True -PassThru
-                $CniConfig.delegate.type = 'sdnoverlay'
-
-                $PolicyValue = $CniConfig.delegate.policies[0].Value
-                $Exceptions = $PolicyValue.ExceptionList
-                $PolicyValue.PSObject.Properties.Remove('ExceptionList')
-                $PolicyValue = $PolicyValue | Add-Member -MemberType NoteProperty -Name 'Settings' -Value @{ Exceptions = $Exceptions }
-
-                $PolicyValue = $CniConfig.delegate.policies[1].Value
-                $PolicyValue.Type = 'SDNROUTE'
-                'DestinationPrefix','NeedEncap' | ForEach-OBject { $PolicyValue.PSObject.Properties.Remove($_) }
-                $PolicyValue = $PolicyValue | Add-Member -MemberType NoteProperty -Name 'Settings' -Value @{ DestinationPrefix = "$ServiceCIDR"; NeedEncap = $True }
-
-                $Policies = $CniConfig.delegate.policies
-                $CniConfig.delegate.PSObject.Properties.Remove('policies')
-                $CniConfig.delegate = $CniConfig.delegate | Add-Member -MemberType NoteProperty -Name 'AdditionalArgs' -Value $Policies -PassThru
-            }
-        }
-
-        $Folder = Split-Path $Path -Parent
-        if (!(Test-Path $Folder)) {
-            $null = New-Item -ItemType Directory $Folder
-        }
-
-        $CniConfigJson = ConvertTo-JSON $CniConfig -Depth 100
-        
-        Set-Content -Path $Path -Value $CniConfigJson -Force
-        
-        Write-Host "Generated CNI configuration:`r`n`r`n$CniConfigJson`r`n`r`n"
-    }
+    Remove-Item C:\etc -Recurse -Force:$Force
+    Remove-Item C:\run -Recurse -Force:$Force
 }
 
 function Set-KubernetesWindowsNodeConfiguration {
@@ -2861,67 +2081,9 @@ function Set-KubernetesWindowsNodeConfiguration {
     }
 }
 
-function Set-NetConfig {
-    Param (
-        [string] $Path = $Script:NetworkConfigurationPath,
-
-        [string] $ClusterCIDR = '10.244.0.0/16',
-
-        [ValidateSet('overlay','l2bridge')]
-        [string] $NetworkMode = 'overlay',
-
-        [string] $NetworkName = 'vxlan0'
-    )
-
-    Process {
-        $NetworkMode = $NetworkMode.ToLower()
-        $NetworkName = $NetworkName.ToLower()
-
-        $NetConfig = ConvertFrom-Json '{
-  "Network": "10.244.0.0/16",
-  "Backend": {
-    "name": "cbr0",
-    "type": "host-gw"
-  }
-}
-'
-        $NetConfig.Network = $ClusterCIDR
-        $NetConfig.Backend.name = $NetworkName
-
-        if ($NetworkMode -eq 'overlay') {
-            $NetConfig.Backend.type = 'vxlan'
-        }
-
-        $NetConfigJson = ConvertTo-JSON $NetConfig -Depth 100
-
-        Set-Content -Path $Path -Value $NetConfigJson
-        
-        Write-Host "Generated net-conf Config:`r`n`r`n$NetConfigJson`r`n`r`n"
-    }
-}
-
 function Test-NodeRunning {
     kubectl.exe get nodes/$($env:COMPUTERNAME.ToLower())
     return !$LASTEXITCODE
-}
-
-function Uninstall-ContainerNetworkInterface {
-    Param (
-        [Parameter(Position = 0)]
-        [ValidateSet('flannel','kubenet')]
-        [string] $PluginName = 'flannel',
-
-        [Parameter(Position = 1)]
-        [string] $PluginInstallationPath = 'c:\flannel'
-    )
-
-    switch ($PluginName) {
-        'kubenet' { break }
-        'flannel' {
-            Uninstall-Flanneld -InstallPath $PluginInstallationPath
-            break;
-        }
-    }
 }
 
 function Uninstall-WindowsDefenderFeature {
@@ -2946,24 +2108,6 @@ function Uninstall-WindowsDefenderFeature {
     }
 }
 
-function Uninstall-Flanneld {
-    Param (
-        [Parameter(Position = 0)]
-        $InstallPath = 'C:\flannel'
-    )
-
-    $FlannelSvc = Get-Service 'Flanneld'
-    if ($FlannelSvc) {
-        $FlannelSvc | Remove-Service
-        Write-Host "Uninstalled the $($FlannelSvc.Name) service."
-    }
-
-    if (Test-Path $InstallPath) {
-        Remove-Item $InstallPath -Force -Recurse -ErrorAction SilentlyContinue
-        Write-Host "Removed flanneld."
-    }
-}
-
 function Uninstall-Kubelet {
     Write-Host "Uninstalling Kubelet Service"
     # close firewall for 10250
@@ -2981,14 +2125,6 @@ function Uninstall-Kubelet {
      
     & cmd /c kubeadm reset -f '2>&1'
     Write-Host 'Removed this node from the kubernetes cluster.'
-}
-
-function Uninstall-KubeProxy {
-    $Service = Get-Service 'kubeproxy'
-    if ($Service) {
-        $Service | Remove-Service
-        Write-Host 'Uninstalled the KubeProxy service.'
-    }
 }
 
 function Write-KubernetesWindowsNodeConfiguration {
