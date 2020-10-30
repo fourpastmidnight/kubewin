@@ -57,6 +57,11 @@ function DownloadFile {
             if (!$Destination) {
                 curl.exe -L $Url | ForEach-Object -Begin { $result = New-Object System.Text.StringBuilder } -Process { $result = $result.Append($_) } -End { $result.ToString() }
             } else {
+                $Path = Split-Path $Destination -Parent
+                if (!(Test-Path $Path)) {
+                    $null = New-Item -ItemType Directory -Path $Path
+                }
+
                 curl.exe -L $Url -o $Destination
                 Write-Host "Downloaded [$Url] => [$Destination]"
             }
@@ -755,6 +760,7 @@ function Get-WindowsBuildVersion {
 
 function Install-ContainerNetworkInterface {
     [CmdletBinding()]
+    [OutputType([System.ServiceProcess.ServiceController])]
     Param (
         [string] $InterfaceName = 'Ethernet',
 
@@ -946,6 +952,7 @@ function Install-Flanneld {
 
 function Install-Kubelet {
     [CmdletBinding()]
+    [OutputType([System.ServiceProcess.ServiceController])]
     Param (
         [string] $CniConfigurationPath = $Script:CniConfigurationPath,
         [string] $CniPath = $Script:CniPath,
@@ -979,7 +986,8 @@ function Install-Kubelet {
             $null = New-Item -ItemType Directory -Path $Script:KubernetesClusterNodeLogPath
         }
 
-        if (!(Get-Service 'kubelet' -ErrorAction SilentlyContinue)) {
+        $KubeletSvc = Get-Service 'kubelet' -ErrorAction SilentlyContinue
+        if (!$KubeletSvc) {
             Set-CniConfiguration -Path $CniConfigurationPath -NodeIpAddress $NodeIpAddress -NodeSubnet $NodeSubnet -PluginName $CniPluginName -NetworkMode $NetworkMode -NetworkName $NetworkName -ClusterCIDR $ClusterCIDR -ServiceCIDR $ServiceCIDR -ErrorAction Stop
 
             $KubeletArgs = @(
@@ -1008,22 +1016,22 @@ function Install-Kubelet {
                 $KubeletArgs += "--feature-gates=$($FeatureGates -join ',')"
             }
 
-            New-Service -Name 'kubelet' -StartupType Automatic -DependsOn 'docker' `
-                -BinaryPathName "$KubeletArgs"
+            $KubeletSvc = New-Service -Name 'kubelet' -StartupType Automatic -DependsOn 'docker' -BinaryPathName "$KubeletArgs"
 
             if (!(Get-NetFirewallRule -Name KubeletAllow10250 -ErrorAction SilentlyContinue)) {
                 $null = New-NetFirewallRule -Name KubeletAllow10250 -Description "Kubelet Allow 10250" -Action Allow -LocalPort 10250 -Protocol TCP -Enabled True -DisplayName "Kubelet Allow 10250 (TCP)" -ErrorAction Stop
             }
-
-            Get-Service -Name 'Kubelet'
         }
+
+        $KubeletSvc
     }
 }
 
 function Install-KubeProxy {
     [CmdletBinding()]
+    [OutputType([System.ServiceProcess.ServiceController])]
     Param (
-        [string] $KubeProxypConfigPath = $(Join-Path $Script:KubernetesClusterNodeInstallationPath 'kubeproxy.conf'),
+        [string] $KubeProxyConfigPath = $(Join-Path $Script:KubernetesClusterNodeInstallationPath 'kube-proxy.conf'),
 
         [string] $KubeProxyLogPath = $(Join-Path $Script:KubernetesClusterNodeLogPath 'kube-proxy'),
 
@@ -1039,11 +1047,12 @@ function Install-KubeProxy {
     )
 
     Process {
-        if (!(Get-Service 'kubeproxy' -ErrorAction SilentlyContinue)) {
+        $KubeProxySvc = Get-Service 'kube-proxy' -ErrorAction SilentlyContinue
+        if (!$KubeProxySvc) {
             $NetworkName = $NetworkName.ToLower()
 
-            if (!(Test-Path $KubeProxyConfigPath)) {
-                $null = New-Item -ItemType Directory -Path $KubeProxyConfigPath
+            if (!(Test-Path (Split-Path $KubeProxyConfigPath -Parent))) {
+                $null = New-Item -ItemType Directory -Path (Split-Path $KubeProxyConfigPath -Parent)
             }
 
             if (!(Test-Path $KubeProxyLogPath)) {
@@ -1053,7 +1062,7 @@ function Install-KubeProxy {
             $KubeProxyConfiguration = @{
                 Kind = 'KubeProxyConfiguration'
                 apiVersion = 'kubeproxy.config.k8s.io/v1alpha1'
-                hostnameOverride = $env:COMPUTERNAME
+                hostnameOverride = $env:COMPUTERNAME.ToLower()
                 clusterCIDR = $ClusterCIDR
                 clientConnection = @{
                     kubeconfig = $KubeConfig
@@ -1068,7 +1077,7 @@ function Install-KubeProxy {
         
             $KubeProxyArgs = @(
                 (Get-Command kube-proxy.exe -ErrorAction Stop).Source
-                "--hostname-override=${env:COMPUTERNAME}"
+                "--hostname-override=$($env:COMPUTERNAME.ToLower())"
                 '--v=6'
                 '--proxy-mode=kernelspace'
                 "--kubeconfig=`"$KubeConfig`""
@@ -1094,16 +1103,18 @@ function Install-KubeProxy {
                 $KubeProxyArgs += "--feature-gates=$($FeatureGates -join ',')"
             }
 
-            ConvertTo-JSON -Depth 100 $KubeProxyConfiguration | Out-File $KubeProxyConfigPath
+            ConvertTo-JSON -Depth 100 $KubeProxyConfiguration | Set-Content $KubeProxyConfigPath
 
-            New-Service -Name 'kubeproxy' -StartupType Automatic -DisplayName 'KubeProxy' -Description 'KubeProxy Kubernetes Service' -BinaryPathName "$KubeProxyArgs" |
-                Start-Service -ErrorAction Stop
+            $KubeProxySvc = New-Service -Name 'kube-proxy' -StartupType Automatic -DisplayName 'Kube-Proxy' -Description 'Kube-Proxy Kubernetes Service' -BinaryPathName "$KubeProxyArgs"
         }
+
+        $KubeProxySvc
     }
 }
 
 function Install-RancherWins {
     [CmdletBinding()]
+    [OutputType([System.ServiceProcess.ServiceController])]
     Param (
         [string] $Path = $Script:WinsPath,
         [string] $Version = 'latest',
@@ -1130,19 +1141,17 @@ function Install-RancherWins {
             DownloadFile -Url "https://github.com/rancher/wins/releases/download/$Version/wins.exe" -Destination (Join-Path $Path 'wins.exe') -Force:$Force -ErrorAction Stop
         
             if ($env:PATH -inotmatch 'C:\wins;') {
-                $env:PATH = "$env:PATH;C:\wins" -replace ';;'
+                $env:PATH = "$env:PATH;C:\wins" -replace ';;',';'
                 [Environment]::SetEnvironmentVariable('PATH',$env:PATH,[EnvironmentVariableTarget]::Machine)
             }
 
             # Register wins as a service
             wins.exe srv app run --register
 
-            $WinsSvc = Get-Service rancher-wins
+            $WinsSvc = Get-Service rancher-wins -ErrorAction Stop
         }
 
-        if ($WinsSvc.Status -ne 'Running') {
-            $WinsSvc | Start-Service
-        }
+        $WinsSvc
     }
 }
 
@@ -1168,9 +1177,6 @@ function Join-KubernetesCluster {
         [Environment]::SetEnvironmentVariable('KUBE_NETWORK', $env:KUBE_NETWORK, [EnvironmentVariableTarget]::Machine)
     }
 
-    Install-RancherWins -Path $Script:WinsPath -Version $Script:Config.Wins.Version
-    Write-Host "Rancher Wins has been installed as a Windows Service."
-
     $InstallKubeletParams = @{
         CniPath = $Script:CniPath
         CniConfigurationPath = $Script:CniConfigurationPath
@@ -1186,9 +1192,10 @@ function Join-KubernetesCluster {
         DnsServiceIpAddress = $Script:Config.Kubernetes.Network.DnsServiceIpAddress
         FeatureGates = $Script:Config.Kubernetes.Kubelet.FeatureGates
     }
-    Install-Kubelet -ErrorAction Stop @InstallKubeletParams
+    $null = Install-Kubelet -ErrorAction Stop @InstallKubeletParams
     Write-Host "Installed Kubelet as a Windows Service"
     
+    <#
     $InstallCNIParams = @{
         InterfaceName = $(
             $NetworkAdatpter = Get-NetAdapter -InterfaceAlias "vEthernet ($($Script:Config.Node.InterfaceName))" -ErrorAction SilentlyContinue
@@ -1206,8 +1213,22 @@ function Join-KubernetesCluster {
         ClusterCIDR = $Script:Config.Kubernetes.Network.ClusterCIDR
         KubeConfig = $env:KUBECONFIG
     }
-    Install-ContainerNetworkInterface -ErrorAction Stop @InstallCNIParams
+    $null = Install-ContainerNetworkInterface -ErrorAction Stop @InstallCNIParams
     Write-Host "Finished installing the Container Network Interface (CNI)."
+    #>
+
+    $null = Install-RancherWins -Path $Script:WinsPath -Version $Script:Config.Wins.Version
+    Write-Host "Rancher Wins has been installed as a Windows Service."
+
+    # IMPORTANT: Ordering is important, Kubelet, THEN FlannelD, THEN rancher-wins.
+    Write-Host 'Starting Kubelet...'
+    Start-Service Kubelet
+    #Write-Host 'Starting FlannelD...'
+    #Start-Service FlannelD
+    #WaitForNetwork $Script:Config.Cni.NetworkName
+    Write-Host 'Starting Rancher Wins...'
+    Start-Service rancher-wins
+    WaitForNetwork 'flannel.4096'
 
     kubeadm.exe join "$(Get-ApiServerEndpoint)" --token $Script:Config.Kubernetes.ControlPlane.JoinToken --discovery-token-ca-cert-hash "$($Script:Config.Kubernetes.ControlPlane.CAHash)"
     if (!$?) {
@@ -1215,13 +1236,8 @@ function Join-KubernetesCluster {
         return
     }
 
-    WaitForNetwork $NetworkName
-
-    if (!(Test-NodeRunning)) {
-        throw "Kubelet is not running and/or failed to bootstrap."
-    }
-    
     $KubeProxyInstallParams = @{
+        KubeProxyConfigPath = Join-Path $Script:KubernetesClusterNodeInstallationPath 'kube-proxy.conf'
         NetworkName = $Script:Config.Cni.NetworkName
         ClusterCIDR = $Script:Config.Kubernetes.Network.ClusterCIDR
         FeatureGates = $Script:Config.Kubernetes.KubeProxy.FeatureGates
@@ -1230,7 +1246,12 @@ function Join-KubernetesCluster {
         $KubeProxyInstallParams += @{ SourceVip = (Get-SourceVip -NetworkName $Script:Config.Cni.NetworkName) }
     }
     Install-KubeProxy -ErrorAction Stop @KubeProxyInstallParams
+    Start-Service 'kube-proxy'
     Write-Host "Installed Kube-Proxy as a Windows Service"
+
+    if (!(Test-NodeRunning)) {
+        throw "Kubelet is not running and/or failed to bootstrap."
+    }
 
     kubectl.exe get nodes
 
@@ -2654,7 +2675,7 @@ function Set-CniConfiguration {
 
         if ($NetworkMode -ieq 'l2bridge') {
             $CniConfig = ConvertFrom-JSON '{
-    "cniVersion": "0.2.0",
+    "cniVersion": "0.3.0",
     "name": "<NetworkName>",
     "type": "flannel",
     "capabilities": {
@@ -2729,7 +2750,7 @@ function Set-CniConfiguration {
             }
         } else {
             $CniConfig = ConvertFrom-JSON '{
-    "cniVersion": "0.2.0",
+    "cniVersion": "0.3.0",
     "name": "<NetworkName>",
     "type": "flannel",
     "capabilities": {
